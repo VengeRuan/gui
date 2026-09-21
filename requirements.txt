@@ -1,0 +1,26 @@
+# Runtime environment for gui.py / gui_core.pyc
+# Use CPython 3.11 (64-bit).  tkinter is bundled with the official Windows
+# CPython installer and must be included during Python installation.
+
+numpy==2.4.4
+scipy==1.17.1
+seaborn==0.13.2
+
+# Qt desktop UI and high-performance all-channel overview
+PyQt6==6.11.0
+pyqtgraph==0.14.0
+
+# H5/MAT import and Blosc/LZ4-compressed H5 support
+h5py==3.16.0
+hdf5plugin==7.0.0
+
+# Excel channel-layout import
+pandas==3.0.3
+openpyxl==3.1.5
+
+# ICA preprocessing (optional in code, required for the ICA feature)
+mne==1.12.1
+scikit-learn==1.8.0
+
+# Do not install pyarrow for normal GUI use.  It is only for the optional
+# Parquet benchmark and may be blocked by Windows application-control policy.

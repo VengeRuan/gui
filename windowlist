@@ -1,0 +1,25 @@
+from pywinauto import Desktop
+
+for backend in ["uia", "win32"]:
+    print("\n" + "=" * 70)
+    print(f"Backend: {backend}")
+    print("=" * 70)
+
+    try:
+        windows = Desktop(backend=backend).windows(visible_only=False)
+
+        for w in windows:
+            try:
+                info = w.element_info
+
+                print(
+                    f"handle={hex(info.handle)} | "
+                    f"title={w.window_text()!r} | "
+                    f"class={info.class_name!r} | "
+                    f"control_type={getattr(info, 'control_type', '')!r}"
+                )
+            except Exception as e:
+                print("读取单个窗口失败：", e)
+
+    except Exception as e:
+        print(f"{backend} 枚举失败：", e)

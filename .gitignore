@@ -1,0 +1,257 @@
+# =========================
+# Python
+# =========================
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Python test / lint / type-check cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# =========================
+# Environment / Secrets
+# =========================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+
+
+# =========================
+# Logs / Runtime files
+# =========================
+
+*.log
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# PID / runtime files
+*.pid
+*.seed
+
+
+# =========================
+# Temporary files
+# =========================
+
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.old
+*.orig
+*~
+
+tmp/
+temp/
+
+
+# =========================
+# Build / Distribution
+# =========================
+
+build/
+dist/
+
+# PyInstaller
+*.manifest
+
+# 注意：
+# .spec 文件通常应该提交到 Git
+# 所以不要写 *.spec
+
+
+# =========================
+# Node.js
+# =========================
+
+node_modules/
+coverage/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 注意：
+# package-lock.json 应提交
+# 不要忽略 package-lock.json
+
+
+# =========================
+# IDE / Editor
+# =========================
+
+.vscode/
+.idea/
+.cursor/
+
+*.code-workspace
+
+
+# =========================
+# Operating System
+# =========================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+
+
+# =========================
+# Project runtime / generated files
+# =========================
+
+# 本地运行生成的审计数据库
+user_operation_audit.sqlite3
+
+# 如果这些文件确认只是运行时生成结果，可忽略
+log_result.txt
+
+# 如果下面这些 *_dis.txt 都是自动生成的分析文件，
+# 可以取消注释
+#
+# build_import_dis.txt
+# core_load_dis.txt
+# core_preview_dis.txt
+# export_dis.txt
+# scroll_dis.txt
+# sync_dis.txt
+
+
+# =========================
+# Large scientific / EEG data
+# =========================
+
+# 对脑电项目尤其重要：
+# 不建议把大型原始数据直接提交到普通 GitHub 仓库
+
+*.bin
+*.dat
+*.raw
+
+# NumPy data
+*.npy
+*.npz
+
+# MATLAB data
+*.mat
+
+# HDF5 data
+*.h5
+*.hdf5
+
+# Neural data formats
+*.ns1
+*.ns2
+*.ns3
+*.ns4
+*.ns5
+*.ns6
+*.nev
+
+# NWB
+*.nwb
+
+# EDF / BDF
+*.edf
+*.bdf
+
+
+# =========================
+# Machine Learning models
+# =========================
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.weights
+
+# TensorFlow
+*.h5
+*.keras
+
+
+# =========================
+# Large compressed files
+# =========================
+
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+
+# =========================
+# Executables / binaries
+# =========================
+
+*.exe
+*.dll
+*.so
+*.dylib
+
+
+# =========================
+# Optional project folders
+# =========================
+
+# 如果 DL_test 里面是测试代码，不要忽略。
+# 如果里面主要是数据，可以改成：
+#
+# DL_test/data/
+# DL_test/output/
+# DL_test/cache/
+
+
+# =========================
+# Keep important files
+# =========================
+
+!.gitignore
+!README.md
+!requirements.txt
+!package-lock.json
+!*.spec

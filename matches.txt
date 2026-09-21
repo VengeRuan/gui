@@ -1,0 +1,106 @@
+﻿1:"""Qt front-end for the SD EEG analysis application.
+78:QSplitter,
+681:self._plot_widget = pg.PlotWidget()
+1000:class OverviewPageLoadWorker(QThread):
+1001:"""Read one already-downsampled overview page without blocking the UI."""
+1023:class PyQtGraphOverview(QMainWindow):
+1037:raise RuntimeError("Load an HDF5 source before opening the overview.")
+1062:raise ValueError("No requested overview channels are available in the current source.")
+1074:self.setWindowTitle(f"选择 {self.selection_label} 通道（PyQtGraph）" if self.selection_mode else "全通道总览（PyQtGraph）")
+1075:self.resize(1600, 980)
+1137:self.graphics = pg.GraphicsLayoutWidget()
+1368:raise RuntimeError("No overview source is loaded.")
+1427:worker = OverviewPageLoadWorker(self.source, context)
+1455:self.status_label.setText(f"总览页读取失败：{error}")
+1518:# The overview keeps its current numeric values; this corrects
+1562:dialog.resize(1280, 760)
+1564:plot = pg.PlotWidget()
+1602:self.resize(1180, 720)
+2721:raw_car, _ = mne.set_eeg_reference(raw.copy(), ref_channels="average", projection=False, verbose="ERROR")
+4222:# Markers are stored as global EEG sample numbers.  A processed
+5279:self.setWindowTitle("SD 脑电分析 - Qt 迁移版")
+5280:self.resize(1500, 960)
+5657:eeg = "尚未加载脑电文件" if source is None else f"{source.metadata.path.name}｜{source.metadata.channels} 通道｜FS={source.metadata.fs:g} Hz"
+5660:self.preprocess_file_banner.setText("当前预处理数据：尚未加载脑电文件")
+5684:self.alignment_banner.setText(f"当前脑电：{eeg}\n对齐输入：Event CSV={event_name} ｜ 视频检测={detection_name} ｜ 状态={aligned}")
+5687:self.lfp_banner.setText(f"当前脑电：{eeg}\n时间对齐：{aligned} ｜ LFP 数据：{lfp} ｜ 独立选择：{len(self.lfp_selected_ids)} 通道")
+5690:self.spike_banner.setText(f"当前脑电：{eeg}\n时间对齐：{aligned} ｜ Spike 数据：{spike} ｜ 独立选择：{len(self.spike_selected_ids)} 通道")
+5710:self.preprocess_file_banner = QLabel("当前预处理数据：尚未加载脑电文件")
+5920:overview = QPushButton("选择滤波通道（总览）")
+5921:overview.clicked.connect(self.open_preprocess_filter_overview)
+5928:action_buttons = (full_h5, overview, remap_only, show_preprocess_params)
+6145:workspace = QSplitter(Qt.Orientation.Horizontal)
+6711:result_splitter = QSplitter(Qt.Orientation.Horizontal)
+6929:QMessageBox.information(self, "尚未加载数据", "请先加载脑电数据。")
+7237:overview = QPushButton("全通道总览（PyQtGraph）")
+7238:overview.clicked.connect(self.open_import_overview)
+7239:overview_row = QHBoxLayout(); overview_row.addStretch(1); overview_row.addWidget(overview)
+7240:overview_holder = QWidget(); overview_holder.setLayout(overview_row)
+7241:layout.addWidget(overview_holder)
+7414:selector = PyQtGraphOverview(
+7483:"behavior_detection_recording_time_sec", "behavior_detection_video_eeg_offset_sec",
+7502:self.behavior_detection_video_eeg_offset_sec = float(first["video_eeg_offset_sec"])
+7513:f"视频→EEG 偏移={first['video_eeg_offset_sec']:+.6f} s；"
+8276:"""Carry aligned markers to page 4 without analysing an EEG epoch."""
+8704:dialog.resize(1000, 680)
+8723:plot = pg.PlotWidget(); plot.setBackground("w")
+8826:dialog.resize(900, 680)
+8836:plot = pg.PlotWidget(); plot.setBackground("w")
+9181:dialog.resize(980, 720)
+9330:dialog.resize(920, 680)
+9348:plot = pg.PlotWidget(); plot.setBackground("w")
+9376:dialog.resize(900, 700)
+9727:window.resize(1350, 900)
+9742:offset = getattr(self, "behavior_detection_video_eeg_offset_sec", np.nan)
+9743:info = QLabel(f"红虚线=Letter onset；绿点线=StartFrame；橙虚线=EndFrame；紫点划线=有效 AnimalStart。首个 Letter trial 校准；帧率={frame_rate:g} Hz；视频-EEG 偏移={offset:+.6f} s")
+9750:# Creating PlotWidget/OpenGL scene objects is substantially more
+9916:window = QMainWindow(self); window.setWindowTitle(f"ch{ids[channel_index]} 单 trial - tag {result['tag']}"); window.resize(1350, 900)
+9958:window = QMainWindow(parent); window.setWindowTitle("Letter marker / 视频检测时间表"); window.resize(1320, 650)
+10291:def open_remapped_overview(self) -> None:
+10297:self._show_overview(
+10302:window_attr="_remapped_overview_window",
+11140:dialog.resize(1120, 780)
+11158:plot = pg.PlotWidget()
+11376:selector = PyQtGraphOverview(
+11390:"""Run ICA after the dedicated overview selector has been confirmed."""
+11599:dialog.resize(1120, 760)
+11628:plot = pg.PlotWidget(dialog); plot.setBackground("w"); plot.addLegend()
+11925:# overview refer to remapped destination IDs. Reuse that exact source
+12099:f"数据总通道数 {processed_source.metadata.channels}；当前预览、总览和后续分析均使用处理后数据。",
+12103:self.statusBar().showMessage("处理后数据已成为当前预览与全通道总览的数据源。")
+13126:"选择脑电 HDF5 / MAT 文件",
+13128:"EEG files (*.h5 *.hdf5 *.mat);;HDF5 files (*.h5 *.hdf5);;MAT files (*.mat);;All files (*.*)",
+13252:for key in ("rawData512", "raw_data", "data", "eeg", "signal"):
+13262:raise ValueError("MAT 文件中没有二维数值脑电矩阵。")
+13281:def open_import_overview(self) -> None:
+13282:"""Open a read-only raw-data overview for the import page."""
+13296:self._show_overview(
+13301:window_attr="_import_overview_window",
+13304:def open_overview(self) -> None:
+13305:"""Legacy public entry point for the import-page read-only overview."""
+13306:self.open_import_overview()
+13308:def open_preprocess_filter_overview(self) -> None:
+13331:overview = getattr(self, "_preprocess_filter_selector", None)
+13332:if overview is not None:
+13334:if overview.isVisible() and overview.source is source:
+13335:overview.raise_()
+13336:overview.activateWindow()
+13338:if overview.isVisible():
+13339:overview.close()
+13342:overview = PyQtGraphOverview(
+13354:overview.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+13355:overview.showMaximized()
+13356:self._preprocess_filter_selector = overview
+13374:def _show_overview(
+13376:*, full_duration: bool = True, window_attr: str = "_overview_window",
+13378:overview = getattr(self, window_attr, None)
+13379:if overview is not None:
+13381:if overview.isVisible() and overview.source is source:
+13382:overview.raise_()
+13383:overview.activateWindow()
+13385:if overview.isVisible():
+13386:overview.close()
+13390:overview = PyQtGraphOverview(
+13393:overview.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+13394:overview.showMaximized()
+13396:setattr(self, window_attr, overview)

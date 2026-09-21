@@ -1,0 +1,286 @@
+﻿
+### overview ����̨ �����ݵ��뿪ʼ�������Ԥ�������źŷ���
+TButton        '����'  attr=None default=None values=None
+TButton        '�鿴'  attr=None default=None values=None
+TButton        '���'  attr=None default=None values=None
+TButton        '��'  attr=None default=None values=None
+TButton        '��'  attr=None default=None values=None
+TButton        '��'  attr=None default=None values=None
+
+### import ���ݵ��� ���� BIN / H5 ���ݣ���ȷ�ϱ��η�����Χ
+TButton        'ѡ�񵥸� BIN'  attr=None default=None values=None
+TButton        '��ȡ���� H5'  attr=None default=None values=None
+TButton        '�������� BIN'  attr=None default=None values=None
+TButton        'ѡ��Ŀ¼'  attr=None default=None values=None
+TButton        'ȫ��ͨ������'  attr=None default=None values=None
+TButton        'ѡ��Ŀ¼'  attr=None default=None values=None
+TButton        '������������ H5'  attr='save_h5_button_var' default='������������ H5' values=None
+TProgressbar   ''  attr='import_progress_var' default=0.0 values=None
+TButton        'ѡ�� BIN'  attr=None default=None values=None
+TButton        '��ʾ����'  attr='import_params_button_var' default='��ʾ����' values=None
+TButton        '��һ��������Ԥ����'  attr=None default=None values=None
+
+### preprocess ����Ԥ���� ���ͨ��������˲���Ԥ��׼��
+TButton        'ִ��ͨ����ӳ��'  attr=None default=None values=None
+TButton        '�����Զ���ͨ������'  attr=None default=None values=None
+TButton        '�������� H5 ��Ԥ����'  attr=None default=None values=None
+TButton        'ѡ�񵼳�ͨ����20��26��'  attr=None default=None values=None
+TProgressbar   ''  attr='preprocess_filter_progress_var' default=100.0 values=None
+TButton        'ѡ���ļ���'  attr=None default=None values=None
+TButton        'ѡ���ļ�'  attr=None default=None values=None
+TButton        'ִ��ͨ����ӳ��'  attr=None default=None values=None
+TCombobox      'PY_VAR30'  attr='preprocess_filter_mode_var' default='�ر�' values="('�ر�', '��ͨ', '��ͨ', '��ͨ')"
+TCheckbutton   '50 Hz �ݲ�'  attr='preprocess_filter_notch_var' default=0 values=None
+TButton        '�˲�������ָ��ͨ��'  attr=None default=None values=None
+TButton        '�˲�����������ȫ��ͨ��'  attr=None default=None values=None
+TButton        '����ӳ���ȫͨ��������δ�˲���'  attr=None default=None values=None
+TCheckbutton   '���� ICA'  attr='motion_ica_enable_var' default=0 values=None
+TButton        '��ѡ��ͨ��Ӧ�� ICA'  attr=None default=None values=None
+TButton        'Ԥ�� ICA'  attr=None default=None values=None
+TButton        '�������� ICA SNR'  attr=None default=None values=None
+TButton        '��� ICA'  attr=None default=None values=None
+TCheckbutton   '���û������'  attr='bad_check_var' default=1 values=None
+TCheckbutton   '���ò���'  attr='bad_parallel_var' default=1 values=None
+TCheckbutton   '2 �봰�ڼ��'  attr='bad_2s_window_var' default=0 values=None
+TButton        '���л������'  attr=None default=None values=None
+TButton        '��ʾ����'  attr='preprocess_params_button_var' default='��ʾ����' values=None
+TButton        '��һ�������ʱ�����'  attr=None default=None values=None
+TEntry         'PY_VAR298'  attr='preprocessed_preview_channel_var' default='1' values=None
+TEntry         'PY_VAR299'  attr='preprocessed_preview_start_var' default='0' values=None
+TEntry         'PY_VAR300'  attr='preprocessed_preview_duration_var' default='5' values=None
+TEntry         'PY_VAR301'  attr='preprocessed_preview_linewidth_var' default='0.55' values=None
+TButton        'View processed channel'  attr=None default=None values=None
+TButton        '< Prev'  attr=None default=None values=None
+TButton        'Next >'  attr=None default=None values=None
+TButton        'Fullscreen overview (10x10)'  attr=None default=None values=None
+Button         'Home'  attr=None default=None values=None
+Button         'Back'  attr=None default=None values=None
+Button         'Forward'  attr=None default=None values=None
+Button         'Subplots'  attr=None default=None values=None
+Button         'Save'  attr=None default=None values=None
+
+### alignment ʱ����� ������� trial��tag��letter onset �� marker
+TCombobox      'PY_VAR144'  attr='alignment_task_mode_var' default='Letter' values="('Flash', 'Letter')"
+TButton        'ѡ���ļ�'  attr=None default=None values=None
+TButton        'ѡ���ļ�'  attr=None default=None values=None
+TButton        'ѡ���ļ�'  attr=None default=None values=None
+TButton        '���㲢ˢ�¶���'  attr=None default=None values=None
+TButton        '�����Զ���ͨ������'  attr=None default=None values=None
+TButton        'Flash ����'  attr=None default=None values=None
+TButton        'Letter ����'  attr=None default=None values=None
+
+### snr LFP ���� �鿴 LFP SNR��ͨ�������Ͳ���Ԥ��
+TProgressbar   ''  attr='lfp_progress_var' default=0.0 values=None
+TButton        '���� LFP SNR'  attr=None default=None values=None
+TCombobox      'PY_VAR49'  attr='snr_select_action_var' default='Select > threshold dB' values="('Select > threshold dB', 'Select all finite', 'Select good channels', 'Select bad channels', 'Invert selection', 'Clear selection')"
+TButton        'Ӧ��ѡ��'  attr=None default=None values=None
+TButton        '�����Զ���ͨ������'  attr=None default=None values=None
+TButton        '���� LFP ���'  attr=None default=None values=None
+TButton        '���� CSV ��������'  attr=None default=None values=None
+TCombobox      'PY_VAR50'  attr='snr_view_action_var' default='SNR boxplot' values="('SNR boxplot', '2s window SNR table', '10s dynamic SNR')"
+TButton        '��'  attr=None default=None values=None
+TCombobox      'PY_VAR47'  attr='snr_mode_var' default='resting' values="('resting', 'task')"
+TCombobox      'PY_VAR74'  attr='psd_channel_source_var' default='selected channels' values="('selected channels', 'healthy LFP channels', 'all channels')"
+TCombobox      'PY_VAR80'  attr='psd_scale_var' default='dB' values="('dB', 'linear')"
+TCheckbutton   'extra powerline notch'  attr='psd_powerline_notch_var' default=0 values=None
+TCheckbutton   'mark stim harmonics'  attr='psd_mark_stim_var' default=1 values=None
+TCheckbutton   'mask +/- bandwidth'  attr='psd_mask_stim_var' default=0 values=None
+TCombobox      'PY_VAR115'  attr='analysis_view_mode_var' default='raw' values="('raw', 'overlay')"
+TCombobox      'PY_VAR116'  attr='task_response_aggregate_var' default='Mean' values="('Mean', 'Median')"
+TCheckbutton   'smooth signal'  attr='smooth_signal_var' default=0 values=None
+TCheckbutton   'zscoredata'  attr='zscoredata_var' default=0 values=None
+TCheckbutton   'auto plot marker alignment'  attr='auto_plot_marker_alignment_var' default=0 values=None
+TButton        'Ӧ�� LFP ����'  attr=None default=None values=None
+TButton        '���� PSD'  attr=None default=None values=None
+TButton        '��ʾ LFP ����'  attr='lfp_params_button_var' default='��ʾ LFP ����' values=None
+TButton        '��һ����Spike ����'  attr=None default=None values=None
+
+### flash Spike ���� ���� Spike ���������鿴���
+TButton        '���� Spike ��� / SNR'  attr=None default=None values=None
+TButton        '���� Spike SNR'  attr=None default=None values=None
+TButton        '10 �붯̬ Spike SNR'  attr=None default=None values=None
+TButton        '�����Զ���ͨ������'  attr=None default=None values=None
+TButton        '���� Spike ���'  attr=None default=None values=None
+TButton        'Spike ���� CSV ��������'  attr=None default=None values=None
+TButton        'Flash ����'  attr=None default=None values=None
+TButton        'Letter ����'  attr=None default=None values=None
+TButton        'Ӧ�ò��������'  attr=None default=None values=None
+TButton        '��ʾ Spike ����'  attr='spike_params_button_var' default='��ʾ Spike ����' values=None
+TButton        '��һ�����������'  attr=None default=None values=None
+
+### export ������� ͳһ���� LFP��Spike�������ͨ�����
+TCheckbutton   'LFP SNR CSV'  attr=None default=1 values=None
+TButton        '����'  attr=None default=None values=None
+TCheckbutton   'Spike ��� CSV'  attr=None default=1 values=None
+TButton        '����'  attr=None default=None values=None
+TCheckbutton   'Spike ��� + ͼ'  attr=None default=1 values=None
+TButton        '����'  attr=None default=None values=None
+TCheckbutton   '��ǰ����ͨ�� H5'  attr=None default=0 values=None
+TButton        '����'  attr=None default=None values=None
+TCheckbutton   '��ǰ�������ݼ� H5'  attr=None default=1 values=None
+TButton        '����'  attr=None default=None values=None
+TButton        '������ѡ���'  attr=None default=None values=None
+TButton        'ѡ��Ŀ¼'  attr=None default=None values=None
+TButton        '������ļ���'  attr=None default=None values=None
+
+## Variables
+status_var
+path_var
+output_var
+range_var
+active_file_var
+active_file_summary_var
+parsed_h5_path_var
+preview_channels_var
+preview_start_var
+preview_duration_var
+date_var
+animal_var
+block_var
+sample_rate_summary_var
+channel_count_summary_var
+duration_summary_var
+channel_var
+filter_var
+alignment_var
+import_params_button_var
+batch_status_var
+import_progress_status_var
+import_progress_var
+save_h5_button_var
+channel_folder_var
+remap_rule_var
+preprocess_params_button_var
+preprocess_status_var
+preprocess_filter_status_var
+preprocess_filter_progress_var
+preprocess_filter_mode_var
+preprocess_filter_low_var
+preprocess_filter_high_var
+preprocess_filter_hp_order_var
+preprocess_filter_lp_order_var
+preprocess_filter_notch_var
+preprocess_filter_channels_var
+lfp_params_button_var
+lfp_status_var
+lfp_progress_var
+lfp_selected_summary_var
+lfp_task_status_var
+snr_mode_var
+snr_threshold_var
+snr_select_action_var
+snr_view_action_var
+snr_export_action_var
+snr_highpass_var
+snr_band_low_var
+snr_band_high_var
+filter_highpass_order_var
+filter_lowpass_order_var
+snr_notch_var
+snr_skip_var
+motion_ica_enable_var
+motion_ica_components_var
+motion_ica_exclude_var
+motion_ica_low_var
+motion_ica_high_var
+motion_ica_decim_var
+motion_ica_max_iter_var
+bad_check_var
+bad_parallel_var
+bad_workers_var
+bad_flat_std_var
+bad_flat_ratio_var
+bad_2s_window_var
+bad_valid_window_var
+bad_ptp_var
+psd_channel_source_var
+psd_page_size_var
+psd_welch_sec_var
+psd_overlap_var
+psd_freq_low_var
+psd_freq_high_var
+psd_scale_var
+psd_powerline_notch_var
+psd_powerline_freq_var
+psd_powerline_harmonics_var
+psd_notch_q_var
+psd_mark_stim_var
+psd_stim_freq_var
+psd_stim_harmonics_var
+psd_mask_stim_var
+psd_bandwidth_var
+signal_band_low_var
+signal_band_high_var
+noise_band_low_var
+noise_band_high_var
+stim_interval_var
+stim_duration_var
+first_onset_var
+stim_freq_var
+harmonics_var
+neighbor_bins_var
+fft_len_var
+state_start_var
+state_duration_var
+epoch_start_ms_var
+epoch_end_ms_var
+baseline_start_ms_var
+baseline_end_ms_var
+response_start_ms_var
+response_end_ms_var
+trial_count_var
+n_stim_types_var
+trials_per_stim_var
+stimtag_var
+compare_trial_a_var
+compare_trial_b_var
+analysis_view_mode_var
+task_response_aggregate_var
+analysis_notch_var
+analysis_bandpass_var
+analysis_band_low_var
+analysis_band_high_var
+smooth_signal_var
+smooth_window_size_var
+zscoredata_var
+resting_page_size_var
+tvep_page_size_var
+auto_plot_marker_alignment_var
+spike_params_button_var
+spike_status_var
+spike_task_status_var
+spike_count_summary_var
+spike_rate_summary_var
+spike_unit_summary_var
+spike_state_summary_var
+spike_low_var
+spike_high_var
+spike_threshold_var
+spike_noise_window_var
+spike_step_var
+spike_refractory_var
+spike_pre_samples_var
+spike_post_samples_var
+spike_min_count_var
+alignment_log_var
+alignment_task_mode_var
+game_csv_var
+detection_result_var
+dt1_var
+deltaT1_var
+letter_onset_var
+start_frame_var
+video_time_var
+marker_time_var
+alignment_error_ms_var
+alignment_error_frame_var
+workflow_title_var
+workflow_path_var
+preprocessed_preview_channel_var
+preprocessed_preview_start_var
+preprocessed_preview_duration_var
+preprocessed_preview_linewidth_var
+preprocessed_preview_status_var
+alignment_file_banner_var
+lfp_file_banner_var
+spike_file_banner_var
