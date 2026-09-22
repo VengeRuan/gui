@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import atexit
 import gc
 import os
@@ -810,6 +811,8 @@ def filter_array(
     notch_harmonics: int = 1,
     channels=None,
     channel_input=None,
+    parallel_workers: int = 1,
+    parallel_memory_budget_bytes: int = 512 * 1024 * 1024,
 ):
     """Apply preprocessing filters without silently discarding UI settings.
 
@@ -887,8 +890,22 @@ def filter_array(
     # copy for large disk-backed remapped recordings.
     if not all_channels_selected:
         target[:] = source
-    for first_channel in range(0, selected.size, FILTER_CHANNEL_CHUNK):
-        active_columns = selected[first_channel:first_channel + FILTER_CHANNEL_CHUNK]
+    channel_groups = [
+        (first_channel, selected[first_channel:first_channel + FILTER_CHANNEL_CHUNK])
+        for first_channel in range(0, selected.size, FILTER_CHANNEL_CHUNK)
+    ]
+    requested_workers = max(1, int(parallel_workers))
+    # sosfiltfilt commonly promotes intermediates to float64 and keeps
+    # several work arrays.  Use a deliberately conservative estimate so the
+    # ordinary full-record filter never gains speed by risking an OOM.
+    largest_group = max((columns.size for _first, columns in channel_groups), default=1)
+    estimated_task_bytes = max(1, int(source.shape[0]) * largest_group * 8 * 6)
+    memory_limited_workers = max(
+        1, int(parallel_memory_budget_bytes) // estimated_task_bytes,
+    )
+    actual_workers = min(requested_workers, len(channel_groups), memory_limited_workers)
+
+    def filter_group(first_channel, active_columns):
         if replacement_input is None:
             block = np.asarray(source[:, active_columns], dtype=DATA_DTYPE)
         else:
@@ -896,28 +913,55 @@ def filter_array(
                 first_channel, first_channel + active_columns.size,
             )
             block = np.asarray(replacement_input[:, local_columns], dtype=DATA_DTYPE)
-        if all_channels_selected:
-            output_block = block.copy()
+        output_block = block.copy()
         finite_columns = np.isfinite(block).any(axis=0)
         if finite_columns.any():
             finite_block = block[:, finite_columns]
             try:
                 for sos in filters:
                     finite_block = signal.sosfiltfilt(sos, finite_block, axis=0)
-                if all_channels_selected:
-                    output_block[:, finite_columns] = finite_block
-                else:
-                    target[:, active_columns[finite_columns]] = finite_block
+                output_block[:, finite_columns] = finite_block
             except ValueError:
                 # Very short records cannot be zero-phase filtered safely;
                 # retain the samples instead of failing the whole operation.
-                if all_channels_selected:
-                    output_block[:, finite_columns] = finite_block
-                else:
-                    target[:, active_columns[finite_columns]] = finite_block
-        if all_channels_selected:
+                output_block[:, finite_columns] = finite_block
+        return first_channel, active_columns, output_block
+
+    completed_channels = 0
+    if actual_workers == 1:
+        completed_groups = (
+            filter_group(first_channel, active_columns)
+            for first_channel, active_columns in channel_groups
+        )
+        for _first_channel, active_columns, output_block in completed_groups:
             target[:, active_columns] = output_block
-        report_progress(progress, (first_channel + active_columns.size) / max(1, selected.size), "正在分通道组滤波")
+            completed_channels += active_columns.size
+            report_progress(
+                progress, completed_channels / max(1, selected.size),
+                "正在分通道组滤波（单线程）",
+            )
+    else:
+        # Worker threads only read source data and calculate their private
+        # blocks.  This thread alone writes the shared ndarray/memmap target,
+        # avoiding concurrent storage writes and h5py thread-safety issues.
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            # Submit only one worker-sized batch at a time.  Besides bounding
+            # memory, this preserves the preprocessing worker's opportunity
+            # to observe pause/cancel requests between small channel batches.
+            for batch_first in range(0, len(channel_groups), actual_workers):
+                batch = channel_groups[batch_first:batch_first + actual_workers]
+                futures = [
+                    executor.submit(filter_group, first_channel, active_columns)
+                    for first_channel, active_columns in batch
+                ]
+                for future in as_completed(futures):
+                    _first_channel, active_columns, output_block = future.result()
+                    target[:, active_columns] = output_block
+                    completed_channels += active_columns.size
+                    report_progress(
+                        progress, completed_channels / max(1, selected.size),
+                        f"正在分通道组滤波（{actual_workers}线程）",
+                    )
     if isinstance(target, np.memmap):
         target.flush()
     return target, target_path

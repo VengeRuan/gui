@@ -2956,6 +2956,11 @@ class PreprocessWorker(QThread):
                 notch_harmonics=self.settings.get("notch_harmonics", 1),
                 channels=filter_columns,
                 channel_input=filter_channel_input,
+                # Ordinary “执行滤波” uses one extra compute thread while all
+                # writes remain on this preprocessing worker.  filter_array
+                # automatically falls back to one thread for large records.
+                parallel_workers=2,
+                parallel_memory_budget_bytes=512 * 1024 * 1024,
             )
             processed_source = (
                 working_source
