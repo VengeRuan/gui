@@ -68,9 +68,9 @@ from qt_data_model import (
     read_channel_layout,
     read_channel_remap,
     read_channel_remap_for_ids,
-    electrode_remap_output_limit,
     PROCESS_CHUNK_SAMPLES,
     read_behavior_detection_results,
+    remap_source_from_excel,
     remap_source_streaming,
 )
 from compare_bin_storage import BinReader, create_h5, inspect_bin, parse_filename_metadata, read_timing_metadata
@@ -2824,35 +2824,25 @@ class PreprocessWorker(QThread):
                 raise RuntimeError("请先加载 HDF5 数据。")
             did_remap = bool(self.remap_path) or bool(self.settings.get("already_remapped", False))
             if self.remap_path:
-                # Custom one-channel H5 imports retain physical IDs such as
-                # 500 even though they occupy compact local columns.  Select
-                # mapping destinations by physical ID so reload/remap cannot
-                # shift them.
-                ids = np.asarray(meta.channel_ids, dtype=np.int64)
-                if ids.size == meta.channels and np.all(ids >= 1) and np.unique(ids).size == ids.size:
-                    mapping = read_channel_remap_for_ids(self.remap_path, ids)
-                else:
-                    mapping = read_channel_remap(self.remap_path, meta.channels)
-                working_data, working_cache = remap_source_streaming(
+                working_data, working_cache, mapping, ids, remapped_ids = remap_source_from_excel(
                     self.source,
-                    mapping,
+                    self.remap_path,
                     lambda value, message: self._report_progress(value * 65.0, message),
-                    max_output_channels=electrode_remap_output_limit(meta.channels),
                 )
                 working_source = ArraySource(
                     working_data, meta.fs, meta.time_offset, label="remapped",
                     storage_path=working_cache,
-                    channel_ids=np.arange(1, working_data.shape[1] + 1, dtype=np.int64),
+                    channel_ids=remapped_ids,
                     timing_metadata=meta.timing_metadata,
                     provenance=derive_h5_provenance(
                         getattr(meta, "provenance", None), stage="remapped", fs=meta.fs, unit="mV",
-                        channel_ids=np.arange(1, working_data.shape[1] + 1, dtype=np.int64),
+                        channel_ids=remapped_ids,
                         source=None if getattr(meta, "provenance", None) else {"path": str(meta.path), "dataset": str(meta.dataset)},
                         operation={
                             "name": "channel_remap", "mapping_file": str(self.remap_path),
                             "source_channel_ids": ids,
                             "destination_for_source_channel_ids": mapping,
-                            "destination_channel_ids": np.arange(1, working_data.shape[1] + 1, dtype=np.int64),
+                            "destination_channel_ids": remapped_ids,
                         },
                     ),
                 )
@@ -2864,11 +2854,14 @@ class PreprocessWorker(QThread):
                     filter_columns = None
                 else:
                     selected_destinations = mapping[np.asarray(input_columns, dtype=np.int64)]
-                    selected_destinations = selected_destinations[
-                        (selected_destinations >= 1)
-                        & (selected_destinations <= working_data.shape[1])
-                    ]
-                    filter_columns = np.unique(selected_destinations - 1)
+                    output_column_by_id = {
+                        int(channel_id): index
+                        for index, channel_id in enumerate(remapped_ids)
+                    }
+                    filter_columns = np.unique([
+                        output_column_by_id[int(channel_id)]
+                        for channel_id in selected_destinations
+                    ])
                 filter_progress_start, filter_progress_span = 65.0, 35.0
             else:
                 # Filtering is valid without an Excel map.  Materialize only
@@ -3936,8 +3929,8 @@ class BadChannelWorker(CooperativeWorker):
             self.stage_timings.append(("读取/取得所选通道数据", perf_counter() - data_started))
             self.progress.emit(20.0, "坏道检查：数据已准备，正在计算保留的坏道指标")
 
-            flat_std = float(self.settings["flat_std"])
-            flat_ratio = float(self.settings["flat_ratio"]) / 100.0
+            flat_std = float(self.settings.get("flat_std", 1e-4))
+            flat_ratio = float(self.settings.get("flat_ratio", 0.0)) / 100.0
             fast_artifact_only = bool(self.settings.get("fast_artifact_only", False))
             high_frequency_noise_only = bool(self.settings.get("high_frequency_noise_only", False))
             fast_artifact_enabled = bool(self.settings.get("fast_artifact_check", False))
@@ -3947,7 +3940,7 @@ class BadChannelWorker(CooperativeWorker):
                 high_frequency_noise_enabled = high_frequency_noise_only
 
             saturation_width_percent = float(self.settings.get("saturation_width_percent", 1.0))
-            saturation_ratio_threshold = float(self.settings.get("saturation_ratio_threshold", 50.0)) / 100.0
+            saturation_ratio_threshold = float(self.settings.get("saturation_ratio_threshold", 45.0)) / 100.0
             if fast_artifact_enabled:
                 if not np.isfinite(saturation_width_percent) or not 0.0 < saturation_width_percent <= 100.0:
                     raise ValueError("贴底区间宽度必须在 0 到 100% 之间。")
@@ -4108,16 +4101,21 @@ class BadChannelWorker(CooperativeWorker):
                 raise ValueError("No valid bad-channel columns were selected.")
             channel_ids = np.asarray(meta.channel_ids, dtype=np.int64)[columns]
             channel_count = int(columns.size)
-            flat_std = float(self.settings["flat_std"])
-            flat_ratio = float(self.settings["flat_ratio"]) / 100.0
+            # Retired flat/dead, discrete-level and flat-time rules no longer
+            # expose thresholds or participate in normal bad-channel checks.
+            flat_std = float(self.settings.get("flat_std", 1e-4))
+            flat_ratio = float(self.settings.get("flat_ratio", 0.0)) / 100.0
             fast_only = bool(self.settings.get("fast_artifact_only", False))
             target_only = bool(self.settings.get("high_frequency_noise_only", False))
             fast_enabled = bool(self.settings.get("fast_artifact_check", False))
             target_enabled = bool(self.settings.get("high_frequency_noise_check", False))
-            global_flat_enabled = bool(self.settings.get("global_flat_check", True))
-            discrete_level_enabled = bool(self.settings.get("discrete_level_check", True))
-            flat_time_enabled = bool(self.settings.get("flat_time_check", True))
-            flat_time_all_channels = bool(self.settings.get("flat_time_all_channels", True))
+            # These retired rules cannot be re-enabled by an old settings
+            # file.  The only unconditional guard retained below is too few
+            # finite samples; active classification is saturation/2.5 mV.
+            global_flat_enabled = False
+            discrete_level_enabled = False
+            flat_time_enabled = False
+            flat_time_all_channels = False
             discrete_level_threshold = int(self.settings.get("discrete_level_threshold", 8))
             level_tracking_limit = int(self.settings.get(
                 "discrete_level_tracking_limit", discrete_level_threshold,
@@ -4128,7 +4126,7 @@ class BadChannelWorker(CooperativeWorker):
                 fast_enabled, target_enabled = fast_only, target_only
                 global_flat_enabled = discrete_level_enabled = flat_time_enabled = False
             width_percent = float(self.settings.get("saturation_width_percent", 1.0))
-            saturation_threshold = float(self.settings.get("saturation_ratio_threshold", 50.0)) / 100.0
+            saturation_threshold = float(self.settings.get("saturation_ratio_threshold", 45.0)) / 100.0
             target = float(self.settings.get("high_frequency_noise_target", 2500.0))
             tolerance = float(self.settings.get("high_frequency_noise_tolerance", 1.0))
             target_threshold = float(self.settings.get("high_frequency_noise_ratio_threshold", 50.0)) / 100.0
@@ -4533,38 +4531,6 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
         text = str(value or "").strip().lower()
         return {"healthy": "good", "健康": "good", "坏道": "bad"}.get(text, text)
 
-    @staticmethod
-    def _snapshot_channel_ids(snapshot: dict, path: Path) -> set[int]:
-        """Identify the channel-ID coordinate system used by reviewed labels."""
-        values = snapshot.get("source_channel_ids", [])
-        if isinstance(values, (list, tuple)) and values:
-            try:
-                return {int(value) for value in values}
-            except (TypeError, ValueError):
-                pass
-        try:
-            with h5py.File(path, "r") as h5:
-                if "channel_ids" in h5:
-                    return {
-                        int(value) for value in np.asarray(h5["channel_ids"]).ravel()
-                    }
-        except (OSError, TypeError, ValueError):
-            pass
-        return set()
-
-    @staticmethod
-    def _reviewed_h5_has_remap(path: Path) -> bool:
-        try:
-            with h5py.File(path, "r") as h5:
-                provenance = read_h5_provenance(h5) or {}
-            return any(
-                isinstance(operation, dict)
-                and str(operation.get("name", "")).strip().lower() == "channel_remap"
-                for operation in provenance.get("operations", [])
-            )
-        except OSError:
-            return False
-
     @classmethod
     def _reference_from_snapshot(cls, path: Path, available_ids: set[int]):
         try:
@@ -4604,8 +4570,6 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
             "evaluated_ids": evaluated,
             "reference_bad_ids": reference_bad,
             "manual_overrides": manual,
-            "coordinate_channel_ids": cls._snapshot_channel_ids(snapshot, path),
-            "reviewed_h5_has_remap": cls._reviewed_h5_has_remap(path),
             "source": "H5内嵌QC人工复核结果（未载入处理数据）",
         }
 
@@ -4675,8 +4639,6 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                 "evaluated_ids": set(by_channel),
                 "reference_bad_ids": reference_bad,
                 "manual_overrides": manual,
-                "coordinate_channel_ids": cls._snapshot_channel_ids({}, path),
-                "reviewed_h5_has_remap": cls._reviewed_h5_has_remap(path),
                 "source": f"CSV人工复核结果:{candidate.name}",
             }
         return None
@@ -4690,52 +4652,28 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
         )
 
     @staticmethod
-    def _align_reference_to_mapping(reference, raw_channel_ids, mapping, target_channel_ids):
-        """Convert raw-ID review labels to their Excel H-column destinations."""
+    def _use_remapped_reference_ids(reference, target_channel_ids):
+        """Keep reviewed IDs unchanged because review occurs after remapping."""
         reference = dict(reference)
-        raw_ids = np.asarray(raw_channel_ids, dtype=np.int64).ravel()
-        destinations = np.asarray(mapping, dtype=np.int64).ravel()
-        if raw_ids.size != destinations.size:
-            raise ValueError("原始通道ID数量与Excel映射数量不一致。")
-        raw_set = {int(value) for value in raw_ids}
-        declared_ids = {
-            int(value) for value in reference.get("coordinate_channel_ids", set())
+        available = {int(value) for value in target_channel_ids}
+        reference["evaluated_ids"] = {
+            int(value) for value in reference.get("evaluated_ids", set())
+            if int(value) in available
         }
-        # A QC snapshot exported from the raw 512-column H5 declares exactly
-        # those physical IDs. A review performed after remapping declares the
-        # expanded/target channel set and must not be mapped a second time.
-        labels_use_raw_ids = (
-            bool(declared_ids)
-            and declared_ids == raw_set
-            and not bool(reference.get("reviewed_h5_has_remap", False))
-        )
-        reference["labels_remapped_from_raw"] = labels_use_raw_ids
-        if not labels_use_raw_ids:
-            reference["coordinate_system"] = "target"
-            return reference
-
-        valid_targets = {int(value) for value in target_channel_ids}
-        id_map = {
-            int(raw): int(target)
-            for raw, target in zip(raw_ids, destinations)
-            if int(target) in valid_targets
+        reference["reference_bad_ids"] = {
+            int(value) for value in reference.get("reference_bad_ids", set())
+            if int(value) in available
         }
-
-        def mapped_set(values):
-            return {id_map[int(value)] for value in values if int(value) in id_map}
-
-        reference["evaluated_ids"] = mapped_set(reference["evaluated_ids"])
-        reference["reference_bad_ids"] = mapped_set(reference["reference_bad_ids"])
         reference["manual_overrides"] = {
-            id_map[int(channel)]: result
+            int(channel): result
             for channel, result in reference.get("manual_overrides", {}).items()
-            if int(channel) in id_map
+            if int(channel) in available
         }
-        reference["coordinate_channel_ids"] = mapped_set(declared_ids)
-        reference["coordinate_system"] = "raw_mapped_to_target"
+        reference["labels_remapped_from_raw"] = False
+        reference["coordinate_system"] = "reviewed_remapped_target"
         reference["source"] = (
             str(reference.get("source", "人工复核结果"))
-            + "（审核ID已按Excel H列转换为目标通道ID）"
+            + "（人工标注为重映射后目标ID，原样使用）"
         )
         return reference
 
@@ -4803,7 +4741,7 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                         str(path.resolve()), int(reviewed_stat.st_mtime_ns), int(reviewed_stat.st_size),
                         str(raw_path.resolve()), int(raw_stat.st_mtime_ns), int(raw_stat.st_size),
                         str(self.mapping_path.resolve()), int(mapping_stat.st_mtime_ns), int(mapping_stat.st_size),
-                        "reviewed_target_ids_520_v2_label_alignment",
+                        "reviewed_target_ids_compact_v7_labels_already_remapped",
                     )
                     cached_entry = self.data_cache.get(cache_key)
                     if cached_entry is not None:
@@ -4818,35 +4756,27 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                     else:
                         raw_source = LazyH5Source()
                         raw_meta = raw_source.open(raw_path)
-                        raw_ids = np.asarray(raw_meta.channel_ids, dtype=np.int64)
-                        if (raw_ids.size == raw_meta.channels and np.all(raw_ids >= 1)
-                                and np.unique(raw_ids).size == raw_ids.size):
-                            mapping = read_channel_remap_for_ids(self.mapping_path, raw_ids)
-                        else:
-                            mapping = read_channel_remap(self.mapping_path, raw_meta.channels)
-                        remapped_data, remapped_cache = remap_source_streaming(
+                        remapped_data, remapped_cache, mapping, raw_ids, remapped_ids = remap_source_from_excel(
                             raw_source,
-                            mapping,
+                            self.mapping_path,
                             lambda _value, message, name=path.name: self.progress.emit(
                                 100.0 * completed_runs / total_runs,
                                 f"{name}：{message}",
                             ),
-                            max_output_channels=electrode_remap_output_limit(raw_meta.channels),
                         )
                         source = ArraySource(
                             remapped_data, raw_meta.fs, raw_meta.time_offset,
                             label=f"parameter-sweep-remapped:{raw_path.name}",
                             storage_path=remapped_cache,
-                            channel_ids=np.arange(1, remapped_data.shape[1] + 1, dtype=np.int64),
+                            channel_ids=remapped_ids,
                             timing_metadata=raw_meta.timing_metadata,
                         )
                         meta = source.metadata
-                        mapped_ids = {int(value) for value in np.asarray(mapping).ravel()
-                                      if 1 <= int(value) <= meta.channels}
+                        mapped_ids = {int(value) for value in remapped_ids}
                         reference = self._load_reference(path, meta)
                         if reference is not None:
-                            reference = self._align_reference_to_mapping(
-                                reference, raw_ids, mapping, meta.channel_ids,
+                            reference = self._use_remapped_reference_ids(
+                                reference, meta.channel_ids,
                             )
                         if reference is not None:
                             self.data_cache[cache_key] = {
@@ -5094,7 +5024,7 @@ class BadChannelPairSweepWorker(BadChannelParameterSweepWorker):
             str(reviewed_path.resolve()), int(reviewed_stat.st_mtime_ns), int(reviewed_stat.st_size),
             str(raw_path), int(raw_stat.st_mtime_ns), int(raw_stat.st_size),
             str(self.mapping_path.resolve()), int(map_stat.st_mtime_ns), int(map_stat.st_size),
-            "reviewed_target_ids_520_v2_label_alignment",
+            "reviewed_target_ids_compact_v7_labels_already_remapped",
         )
         cached = self.data_cache.get(key)
         if cached is not None:
@@ -5107,31 +5037,24 @@ class BadChannelPairSweepWorker(BadChannelParameterSweepWorker):
                 return cached["source"], cached["reference"], set(mapped_ids), True
         raw_source = LazyH5Source()
         raw_meta = raw_source.open(raw_path)
-        ids = np.asarray(raw_meta.channel_ids, dtype=np.int64)
-        if ids.size == raw_meta.channels and np.all(ids >= 1) and np.unique(ids).size == ids.size:
-            mapping = read_channel_remap_for_ids(self.mapping_path, ids)
-        else:
-            mapping = read_channel_remap(self.mapping_path, raw_meta.channels)
-        data, storage_path = remap_source_streaming(
-            raw_source, mapping,
+        data, storage_path, mapping, ids, remapped_ids = remap_source_from_excel(
+            raw_source, self.mapping_path,
             lambda _value, message: self.progress.emit(0, message),
-            max_output_channels=electrode_remap_output_limit(raw_meta.channels),
             force_memmap=True,
         )
         source = ArraySource(
             data, raw_meta.fs, raw_meta.time_offset,
             label=f"pair-sweep-remapped:{raw_path.name}", storage_path=storage_path,
-            channel_ids=np.arange(1, data.shape[1] + 1, dtype=np.int64),
+            channel_ids=remapped_ids,
             timing_metadata=raw_meta.timing_metadata,
         )
         reference = self._load_reference(reviewed_path, source.metadata)
         if reference is None:
             raise ValueError("未找到可用的历史人工复核结果。")
-        reference = self._align_reference_to_mapping(
-            reference, ids, mapping, source.metadata.channel_ids,
+        reference = self._use_remapped_reference_ids(
+            reference, source.metadata.channel_ids,
         )
-        mapped_ids = {int(value) for value in np.asarray(mapping).ravel()
-                      if 1 <= int(value) <= source.metadata.channels}
+        mapped_ids = {int(value) for value in remapped_ids}
         self.data_cache[key] = {
             "source": source, "reference": reference, "mapped_ids": mapped_ids,
         }
@@ -5454,11 +5377,31 @@ class BadChannelControlledExperimentWorker(BadChannelPairSweepWorker):
     ))
 
     def __init__(self, paths, base_settings, mapping_path, raw_paths, data_cache,
-                 *, parameter_key=None, values=None):
+                 *, parameter_key=None, values=None, allow_partial_review_scope=False):
         super().__init__(paths, base_settings, "flat", [], [], mapping_path,
                          raw_paths, data_cache)
         self.parameter_key = parameter_key
         self.values = [float(value) for value in (values or [])]
+        # Enabled only by “高召回参数精调”. Historical reviewed H5 files may
+        # contain labels for only part of today's real remapped target IDs.
+        # Evaluate every ID present on both sides without remapping labels.
+        self.allow_partial_review_scope = bool(allow_partial_review_scope)
+
+    def _evaluation_scope(self, reference, mapped_ids) -> set[int]:
+        evaluated = {
+            int(channel) for channel in reference.get("evaluated_ids", set())
+        } & {int(channel) for channel in mapped_ids}
+        if not evaluated:
+            raise ValueError("人工复核通道与原始物理通道映射没有交集。")
+        missing_review_ids = {int(channel) for channel in mapped_ids} - evaluated
+        if missing_review_ids and not self.allow_partial_review_scope:
+            preview = ",".join(map(str, sorted(missing_review_ids)[:20]))
+            suffix = "…" if len(missing_review_ids) > 20 else ""
+            raise ValueError(
+                "人工复核标签没有覆盖全部Excel映射目标通道："
+                f"缺少 {preview}{suffix}。为避免少算通道，本文件未纳入统计。"
+            )
+        return evaluated
 
     def _detect(self, source, columns, settings, *, return_detector=False):
         detector = BadChannelWorker(source, settings, columns=columns,
@@ -5548,17 +5491,11 @@ class BadChannelControlledExperimentWorker(BadChannelPairSweepWorker):
                     source, reference, mapped_ids, reused = self._prepared_record(
                         reviewed_path, raw_path,
                     )
-                    evaluated = set(reference["evaluated_ids"]) & mapped_ids
-                    if not evaluated:
-                        raise ValueError("人工复核通道与原始物理通道映射没有交集。")
+                    evaluated = self._evaluation_scope(reference, mapped_ids)
                     columns = np.flatnonzero(np.isin(
                         source.metadata.channel_ids, sorted(evaluated),
                     ))
                     truth = set(reference["reference_bad_ids"]) & evaluated
-                    unreviewed_high_ids = sorted(
-                        (mapped_ids - set(reference["evaluated_ids"]))
-                        & set(range(513, 521))
-                    )
                     threshold_only = self.parameter_key in self.THRESHOLD_ONLY_KEYS
                     baseline_settings = controlled_settings or self.base_settings
                     if threshold_only:
@@ -5617,7 +5554,6 @@ class BadChannelControlledExperimentWorker(BadChannelPairSweepWorker):
                             "scenario": kind, "value": value, "active": active,
                             "evaluated_count": len(evaluated),
                             "excluded_unmapped_count": len(set(reference["evaluated_ids"]) - mapped_ids),
-                            "unreviewed_high_ids": unreviewed_high_ids,
                             "reference_bad_count": len(truth),
                             "reference_source": reference["source"],
                             "predicted_bad_ids": sorted(predicted) if active else [],
@@ -7556,6 +7492,7 @@ class QtAnalysisGUI(QMainWindow):
         # Retired preprocessing controls remain in the historical Tk audit
         # file only; do not recreate invisible compatibility placeholders.
         retired_variables = {
+            "bad_flat_std_var", "bad_flat_ratio_var",
             "bad_2s_window_var", "bad_valid_window_var", "bad_ptp_var",
             "bad_linear_drift_check_var", "bad_linear_drift_r2_var",
             "bad_linear_drift_order_var", "bad_linear_drift_net_shift_ratio_var",
@@ -8036,12 +7973,10 @@ class QtAnalysisGUI(QMainWindow):
         self.bad_parallel_var = QCheckBox("启用并行")
         self.bad_parallel_var.setChecked(True)
         self.bad_workers_var = QLineEdit("0")
-        self.bad_flat_std_var = QLineEdit("1e-4")
-        self.bad_flat_ratio_var = QLineEdit("60")
         self.bad_fast_artifact_check_var = QCheckBox("\u8d34\u5e95\u9971\u548c\u68c0\u67e5")
         self.bad_fast_artifact_check_var.setChecked(True)
         self.bad_saturation_width_percent_var = QLineEdit("1.0")
-        self.bad_saturation_ratio_threshold_var = QLineEdit("50")
+        self.bad_saturation_ratio_threshold_var = QLineEdit("45")
         self.bad_high_frequency_noise_check_var = QCheckBox("2.5mV附近集中坏道检查")
         self.bad_high_frequency_noise_check_var.setChecked(True)
         self.bad_high_frequency_noise_target_var = QLineEdit("2500")
@@ -8085,7 +8020,6 @@ class QtAnalysisGUI(QMainWindow):
             ("ICA 排除", self.motion_ica_exclude_var), ("ICA 低频", self.motion_ica_low_var),
             ("ICA 高频", self.motion_ica_high_var), ("ICA decim", self.motion_ica_decim_var),
             ("ICA 最大迭代", self.motion_ica_max_iter_var), ("坏道 workers", self.bad_workers_var),
-            ("flat std < mV", self.bad_flat_std_var), ("flat ratio % >", self.bad_flat_ratio_var),
             ("工频谐波数（1=50 Hz）", self.preprocess_filter_notch_harmonics_var),
             ("\u8d34\u5e95\u533a\u95f4\u5bbd\u5ea6 % PTP", self.bad_saturation_width_percent_var),
             ("\u8d34\u5e95\u6bd4\u4f8b\u9608\u503c %", self.bad_saturation_ratio_threshold_var),
@@ -8151,31 +8085,11 @@ class QtAnalysisGUI(QMainWindow):
         show_preprocess_params = QPushButton("显示参数")
         self.preprocess_params_button_var = show_preprocess_params
         show_preprocess_params.clicked.connect(self._toggle_preprocess_parameter_area)
-        batch_bad_check = QPushButton("坏道规则贡献")
-        batch_bad_check.setToolTip(
-            "基于人工复核 H5 追溯并重映射原始 H5；固定参数，逐项去除坏道规则，比较真坏道漏检与误报变化。"
-        )
-        batch_bad_check.clicked.connect(self.run_batch_bad_channel_evaluation)
-        self.batch_bad_channel_evaluation_button = batch_bad_check
-        parameter_sweep = QPushButton("高召回参数精调")
-        parameter_sweep.setToolTip(
-            "先选择本轮变化参数，再在弹窗中调整其余固定参数；用同一批人工复核标签比较完整判断结果。"
-            "已重映射的原始 H5 数据会复用。"
-        )
-        parameter_sweep.clicked.connect(self.run_bad_channel_parameter_sweep)
-        self.bad_channel_parameter_sweep_button = parameter_sweep
-        reset_parameter_sweep_data = QPushButton("更换精调 H5")
-        reset_parameter_sweep_data.setToolTip(
-            "清除当前参数精调文件清单及重映射缓存；下次精调时重新选择 H5。"
-        )
-        reset_parameter_sweep_data.clicked.connect(self.clear_bad_channel_parameter_sweep_data)
-        self.reset_bad_channel_parameter_sweep_data_button = reset_parameter_sweep_data
-        # These five entry actions are the stable top row.  Keep them visible
-        # in novice mode and distribute the available width evenly; the
-        # detailed analysis actions below remain behind “显示参数”.
+        # Keep the four primary preprocessing actions on one row and give
+        # each the same stretch so they fill all space released by the
+        # removed experiment/test buttons.
         action_buttons = (
             full_h5, overview, remap_only, show_preprocess_params,
-            batch_bad_check, parameter_sweep, reset_parameter_sweep_data,
         )
         self._preprocess_action_buttons = action_buttons
         for button in action_buttons:
@@ -8201,7 +8115,7 @@ class QtAnalysisGUI(QMainWindow):
         run_bad_check.clicked.connect(self.run_bad_channel_check)
         show_bad_contribution = QPushButton("当前规则触发数")
         show_bad_contribution.setToolTip(
-            "仅显示本次各规则触发数量；不能据此判断规则是否必要。必要性请使用“坏道规则贡献”逐项去除对照。"
+            "仅显示本次各规则触发数量；不能据此判断规则是否必要。"
         )
         show_bad_contribution.clicked.connect(self.show_current_bad_channel_contribution)
         self.show_bad_channel_contribution_button = show_bad_contribution
@@ -13321,15 +13235,16 @@ class QtAnalysisGUI(QMainWindow):
         try:
             self._bad_channel_fast_only = bool(fast_artifact_only)
             settings = {
-                "flat_std": self.bad_flat_std_var.text() or "1e-4",
-                "flat_ratio": self.bad_flat_ratio_var.text() or "60",
-                "flat_time_all_channels": True,
+                "global_flat_check": False,
+                "discrete_level_check": False,
+                "flat_time_check": False,
+                "flat_time_all_channels": False,
                 "parallel": self.bad_parallel_var.isChecked(),
                 "workers": self.bad_workers_var.text() or "0",
                 "fast_artifact_only": fast_artifact_only,
                 "fast_artifact_check": self.bad_fast_artifact_check_var.isChecked(),
                 "saturation_width_percent": self.bad_saturation_width_percent_var.text() or "1.0",
-                "saturation_ratio_threshold": self.bad_saturation_ratio_threshold_var.text() or "50",
+                "saturation_ratio_threshold": self.bad_saturation_ratio_threshold_var.text() or "45",
                 "high_frequency_noise_check": self.bad_high_frequency_noise_check_var.isChecked(),
                 "high_frequency_noise_only": high_frequency_noise_only,
                 "high_frequency_noise_target": self.bad_high_frequency_noise_target_var.text() or "2500",
@@ -13477,10 +13392,9 @@ class QtAnalysisGUI(QMainWindow):
             return False
         source_ids = np.asarray(source.metadata.channel_ids, dtype=np.int64)
         destinations = read_channel_remap_for_ids(remap_path, source_ids)
-        output_limit = electrode_remap_output_limit(source.metadata.channels)
         id_map = {
             int(old): int(new) for old, new in zip(source_ids, destinations)
-            if 1 <= int(new) <= output_limit
+            if int(new) >= 1
         }
 
         def map_ids(values):
@@ -14059,18 +13973,15 @@ class QtAnalysisGUI(QMainWindow):
     def _bad_channel_experiment_settings(self) -> dict:
         """Freeze the retained bad-channel rules for repeatable experiments."""
         return {
-            "flat_std": self.bad_flat_std_var.text() or "1e-4",
-            "flat_ratio": self.bad_flat_ratio_var.text() or "60",
-            "discrete_level_threshold": 8,
-            "global_flat_check": True,
-            "discrete_level_check": True,
-            "flat_time_check": True,
-            "flat_time_all_channels": True,
+            "global_flat_check": False,
+            "discrete_level_check": False,
+            "flat_time_check": False,
+            "flat_time_all_channels": False,
             "parallel": self.bad_parallel_var.isChecked(),
             "workers": self.bad_workers_var.text() or "0",
             "fast_artifact_check": self.bad_fast_artifact_check_var.isChecked(),
             "saturation_width_percent": self.bad_saturation_width_percent_var.text() or "1.0",
-            "saturation_ratio_threshold": self.bad_saturation_ratio_threshold_var.text() or "50",
+            "saturation_ratio_threshold": self.bad_saturation_ratio_threshold_var.text() or "45",
             "high_frequency_noise_check": self.bad_high_frequency_noise_check_var.isChecked(),
             "high_frequency_noise_target": self.bad_high_frequency_noise_target_var.text() or "2500",
             "high_frequency_noise_tolerance": self.bad_high_frequency_noise_tolerance_var.text() or "1",
@@ -14351,8 +14262,6 @@ class QtAnalysisGUI(QMainWindow):
         baseline_rows = [row for row in result["runs"] if row["scenario"] == "baseline"]
         if {row["path"] for row in baseline_rows} != paths:
             return None, "基线结果不完整。"
-        if any(row.get("unreviewed_high_ids") for row in baseline_rows):
-            return None, "513～520 中有已映射信号缺少人工复核标签；这些通道未计入 TP/FP/FN，不能推荐完整评估参数。"
         baseline = cls._controlled_metric_summary(baseline_rows)
         for value in result["values"]:
             rows = [row for row in result["runs"]
@@ -14397,9 +14306,6 @@ class QtAnalysisGUI(QMainWindow):
             summary.append(["原设置", float(result["base_settings"][result["parameter_key"]])])
             summary.append(["达标建议值", choice["value"] if choice else "无"])
             summary.append(["选择依据", rationale])
-            missing_high = sorted({channel for row in baseline_rows
-                                   for channel in row.get("unreviewed_high_ids", [])})
-            summary.append(["513～520 待人工复核目标ID", self._format_id_list(missing_high)])
             summary.append(["对照设计", "同一批文件、映射、人工标签及其他规则固定；每轮只改变一个参数数值。"])
             summary.append(["已排除规则", "全局平直/低波动、离散水平过少、平直时间比例不参与本轮基线或扫描判定。"])
             summary.append(["证据范围", "同批数据回顾性调参；不是独立验证，不能直接证明对新文件同样有效。"])
@@ -14419,20 +14325,19 @@ class QtAnalysisGUI(QMainWindow):
                               score["fn"]-baseline["fn"],
                               "是" if score["recall"] >= .98 and score["min_file_recall"] >= .95 else "否"])
             detail = workbook.create_sheet("逐文件对照")
-            detail.append(["人工复核H5", "原始H5", "场景", "参数值", "评估通道", "未纳入评估通道数",
+            detail.append(["人工复核H5", "原始H5", "场景", "参数值", "评估通道",
                            "人工坏道", "TP", "FP", "FN", "TN", "Precision", "Recall", "预测坏道ID",
                            "相对基线漏掉的真坏道ID", "相对基线减少的误报ID",
-                           "相对基线新增的真坏道ID", "相对基线新增的误报ID", "513～520 未复核目标ID"])
+                           "相对基线新增的真坏道ID", "相对基线新增的误报ID"])
             for row in result["runs"]:
                 detail.append([row["file"], row["raw_path"], row["scenario"], row["value"],
-                               row["evaluated_count"], row["excluded_unmapped_count"],
+                               row["evaluated_count"],
                                row["reference_bad_count"], row["tp"], row["fp"], row["fn"], row["tn"],
                                row["precision"], row["recall"], self._format_id_list(row["predicted_bad_ids"]),
                                self._format_id_list(row["tp_lost_vs_baseline_ids"]),
                                self._format_id_list(row["fp_removed_vs_baseline_ids"]),
                                self._format_id_list(row["tp_gained_vs_baseline_ids"]),
-                               self._format_id_list(row["fp_added_vs_baseline_ids"]),
-                               self._format_id_list(row.get("unreviewed_high_ids", []))])
+                               self._format_id_list(row["fp_added_vs_baseline_ids"])])
             fixed = workbook.create_sheet("实际测试设置")
             fixed.append(["参数", "基线测试值"])
             for key, value in result["evaluation_settings"].items():
@@ -14980,6 +14885,7 @@ class QtAnalysisGUI(QMainWindow):
             filenames, current_settings, mapping_path, raw_paths,
             self._bad_channel_sweep_data_cache,
             parameter_key=parameter_key, values=values,
+            allow_partial_review_scope=True,
         )
         worker.progress.connect(self._update_preprocess_progress)
         worker.completed.connect(lambda result, path=output: self._finish_controlled_bad_channel_sweep(path, result))
@@ -15648,15 +15554,10 @@ class QtAnalysisGUI(QMainWindow):
         checked = lambda widget: "☑ 已勾选" if widget.isChecked() else "☐ 未勾选"
         return [
             (
-                "坏道判断｜平直/低波动",
-                f"☑ 固定执行；通道 STD < {self.bad_flat_std_var.text() or '1e-4'} mV，"
-                f"低波动窗口比例 > {self.bad_flat_ratio_var.text() or '60'}%。",
-            ),
-            (
                 "坏道判断｜贴底饱和",
                 f"{checked(self.bad_fast_artifact_check_var)}；贴底区间宽度="
                 f"PTP 的 {self.bad_saturation_width_percent_var.text() or '1.0'}%，"
-                f"贴底采样点比例阈值={self.bad_saturation_ratio_threshold_var.text() or '50'}%。",
+                f"贴底采样点比例阈值={self.bad_saturation_ratio_threshold_var.text() or '45'}%。",
             ),
             (
                 "坏道判断｜2.5mV附近集中",

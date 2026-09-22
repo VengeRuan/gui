@@ -38,20 +38,6 @@ _PROCESS_CACHE_LOCK = threading.Lock()
 _PROCESS_CACHE_PATHS: set[Path] = set()
 _PROCESS_CACHE_ARRAYS: list[weakref.ReferenceType] = []
 _PROCESS_CACHE_NAME = re.compile(r"_(\d+)_(\d+)\.dat$")
-# A 512-column electrode recording can map into the 20x26 layout: its
-# destinations need not be confined to positions 1..512. A 520-column
-# acquisition retains the electrode-only 512-output limit.
-REMAPPED_ELECTRODE_CHANNELS = 512
-REMAPPED_LAYOUT_CHANNELS = 520
-
-
-def electrode_remap_output_limit(source_channels: int) -> int:
-    """Preserve layout positions for electrode-only input; omit auxiliary input."""
-    if int(source_channels) <= REMAPPED_ELECTRODE_CHANNELS:
-        return REMAPPED_LAYOUT_CHANNELS
-    return REMAPPED_ELECTRODE_CHANNELS
-
-
 def _text(value) -> str:
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
 
@@ -701,27 +687,29 @@ def read_channel_layout(path: str | Path, channel_count: int) -> np.ndarray:
 def remap_array(
     source, mapping, progress=None, *, max_output_channels: int | None = None,
 ):
-    """Inverse-map channel columns in sample chunks without duplicate copies."""
+    """Return mapped columns in target-ID order without materializing ID gaps.
+
+    ``max_output_channels`` is retained only for call compatibility.  It no
+    longer truncates target IDs: a target ID is an identity, not an array
+    position, so large IDs and gaps must not discard data or create zero
+    columns.  Callers that need the real output IDs should use
+    :func:`remap_source_from_excel`, which returns them explicitly.
+    """
     source = np.asarray(source)
     if source.ndim != 2:
         raise ValueError(f"Remapping needs a 2D matrix, got {source.shape}.")
     mapping = np.asarray(mapping, dtype=np.int64).ravel()
     if mapping.size != source.shape[1]:
         raise ValueError(f"Mapping has {mapping.size} values for {source.shape[1]} data channels.")
-    output_channels = int(mapping.max())
-    if max_output_channels is not None:
-        output_channels = min(output_channels, max(1, int(max_output_channels)))
-    inverse = np.full(output_channels, -1, dtype=np.int64)
-    retained = (mapping >= 1) & (mapping <= output_channels)
-    inverse[mapping[retained] - 1] = np.flatnonzero(retained)
-    target, target_path = allocate_storage((source.shape[0], output_channels), source.dtype, "remapped")
-    destinations = np.flatnonzero(inverse >= 0)
-    inputs = inverse[destinations]
+    if np.any(mapping < 1) or np.unique(mapping).size != mapping.size:
+        raise ValueError("Mapping must contain unique positive target channel IDs.")
+    source_order = np.argsort(mapping, kind="stable")
+    target, target_path = allocate_storage(
+        (source.shape[0], mapping.size), source.dtype, "remapped",
+    )
     for first in range(0, source.shape[0], PROCESS_CHUNK_SAMPLES):
         last = min(source.shape[0], first + PROCESS_CHUNK_SAMPLES)
-        destination = target[first:last]
-        destination.fill(0)
-        destination[:, destinations] = source[first:last, inputs]
+        target[first:last] = source[first:last, source_order]
         report_progress(progress, last / max(1, source.shape[0]), "正在进行通道重映射")
     if isinstance(target, np.memmap):
         target.flush()
@@ -735,9 +723,13 @@ def remap_source_streaming(
     """Remap a source directly into one output store, one time chunk at a time.
 
     Unlike ``source.materialize()`` followed by :func:`remap_array`, this
-    never creates a full raw-data cache before remapping.  It preserves the
-    same inverse mapping and zero-filled missing FPC positions while keeping
-    only one input chunk plus one output chunk in memory.
+    never creates a full raw-data cache before remapping.  Output is compact:
+    columns are sorted by actual target ID, absent IDs create no columns, and
+    no target ID is dropped because its numeric value is large.
+
+    ``max_output_channels`` is retained only for call compatibility and is
+    intentionally ignored; target IDs are identities rather than dense array
+    positions.
     """
     meta = getattr(source, "metadata", None)
     if meta is None:
@@ -753,14 +745,11 @@ def remap_source_streaming(
     mapping = np.asarray(mapping, dtype=np.int64).ravel()
     if mapping.size != selected_columns.size:
         raise ValueError(f"Mapping has {mapping.size} values for {selected_columns.size} selected data channels.")
-    output_channels = int(mapping.max())
-    if max_output_channels is not None:
-        output_channels = min(output_channels, max(1, int(max_output_channels)))
-    inverse = np.full(output_channels, -1, dtype=np.int64)
-    retained = (mapping >= 1) & (mapping <= output_channels)
-    inverse[mapping[retained] - 1] = np.flatnonzero(retained)
-    destinations = np.flatnonzero(inverse >= 0)
-    inputs = inverse[destinations]
+    if np.any(mapping < 1) or np.unique(mapping).size != mapping.size:
+        raise ValueError("Mapping must contain unique positive target channel IDs.")
+    source_order = np.argsort(mapping, kind="stable")
+    ordered_columns = selected_columns[source_order]
+    output_channels = int(mapping.size)
     target, target_path = allocate_storage(
         (meta.rows, output_channels), DATA_DTYPE, "remapped",
         force_memmap=force_memmap,
@@ -770,9 +759,7 @@ def remap_source_streaming(
     total_chunks = max(1, int(np.ceil(meta.rows / chunk_rows)))
 
     def write_chunk(first: int, last: int, values) -> None:
-        destination = target[first:last]
-        destination.fill(0)
-        destination[:, destinations] = np.asarray(values, dtype=DATA_DTYPE)[:, inputs]
+        target[first:last] = np.asarray(values, dtype=DATA_DTYPE)
 
     # Keep one HDF5 handle for the whole stream.  This both respects the
     # source chunk layout and avoids repeatedly opening a large compressed H5.
@@ -782,10 +769,15 @@ def remap_source_streaming(
             for index, first in enumerate(range(0, meta.rows, chunk_rows), start=1):
                 last = min(meta.rows, first + chunk_rows)
                 report_progress(progress, (index - 1) / total_chunks, f"HDF5 chunk 读取/重映射中 {index}/{total_chunks}（行 {first:,}-{last:,}）")
-                if np.array_equal(selected_columns, np.arange(selected_columns.size)):
-                    values = np.asarray(dataset[first:last, :selected_columns.size], dtype=DATA_DTYPE)
+                if np.array_equal(ordered_columns, np.arange(ordered_columns.size)):
+                    values = np.asarray(dataset[first:last, :ordered_columns.size], dtype=DATA_DTYPE)
                 else:
-                    values = np.asarray(dataset[first:last, selected_columns], dtype=DATA_DTYPE)
+                    values = np.asarray(
+                        LazyH5Source._read_dataset_columns(
+                            dataset, slice(first, last), ordered_columns,
+                        ),
+                        dtype=DATA_DTYPE,
+                    )
                 if meta.scale_to_mv != 1.0:
                     values *= meta.scale_to_mv
                 write_chunk(first, last, values)
@@ -794,7 +786,7 @@ def remap_source_streaming(
         for index, first in enumerate(range(0, meta.rows, chunk_rows), start=1):
             last = min(meta.rows, first + chunk_rows)
             report_progress(progress, (index - 1) / total_chunks, f"分块读取/重映射中 {index}/{total_chunks}（行 {first:,}-{last:,}）")
-            write_chunk(first, last, source.read(first, last, selected_columns))
+            write_chunk(first, last, source.read(first, last, ordered_columns))
             report_progress(progress, index / total_chunks, f"分块已读取并重映射 {index}/{total_chunks}（行 {first:,}-{last:,}）")
     if isinstance(target, np.memmap):
         target.flush()
@@ -929,6 +921,44 @@ def filter_array(
     if isinstance(target, np.memmap):
         target.flush()
     return target, target_path
+
+
+def remap_source_from_excel(
+    source, mapping_path: str | Path, progress=None, *, force_memmap: bool = False,
+):
+    """Run the GUI's canonical “执行通道重映射” operation.
+
+    All callers—including parameter experiments—must use this entry point so
+    the Excel interpretation, physical-ID lookup, output limit and streaming
+    data movement remain identical to the preprocessing button.
+    """
+    meta = getattr(source, "metadata", None)
+    if meta is None:
+        raise RuntimeError("Load a source before remapping.")
+    source_ids = np.asarray(meta.channel_ids, dtype=np.int64).ravel()
+    if (
+        source_ids.size == meta.channels
+        and np.all(source_ids >= 1)
+        and np.unique(source_ids).size == source_ids.size
+    ):
+        mapping = read_channel_remap_for_ids(mapping_path, source_ids)
+    else:
+        mapping = read_channel_remap(mapping_path, meta.channels)
+    # Compact output: keep only real mapped channels. Sort columns by their
+    # target channel ID, but preserve those actual IDs separately instead of
+    # allocating every integer position up to mapping.max() and zero-filling
+    # gaps.
+    source_order = np.argsort(mapping, kind="stable")
+    target_channel_ids = np.asarray(mapping[source_order], dtype=np.int64)
+    compact_positions = np.arange(1, target_channel_ids.size + 1, dtype=np.int64)
+    data, storage_path = remap_source_streaming(
+        source,
+        compact_positions,
+        progress,
+        force_memmap=force_memmap,
+        source_columns=source_order,
+    )
+    return data, storage_path, mapping, source_ids, target_channel_ids
 
 
 def parse_alignment_log(path: str | Path, delta_t1_sec: float = 0.0) -> dict:

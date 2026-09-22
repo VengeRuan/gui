@@ -77,7 +77,7 @@ class BadChannelThresholdTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertIn("saturation: bottom=100.0%", output[0][1][1])
 
-    def test_default_saturation_ratio_is_49_percent(self):
+    def test_default_saturation_threshold_is_45_percent(self):
         values = np.concatenate((
             np.full(495, -1.0, dtype=np.float32),
             np.full(505, 1.0, dtype=np.float32),
@@ -93,7 +93,7 @@ class BadChannelThresholdTests(unittest.TestCase):
         worker.run()
         self.assertFalse(errors)
         self.assertIn("saturation: bottom=49.5%", output[0][1][1])
-        self.assertEqual(worker.fast_artifact_rows[0]["saturation_ratio_threshold"], 0.49)
+        self.assertEqual(worker.fast_artifact_rows[0]["saturation_ratio_threshold"], 0.45)
 
     def test_below_50_percent_does_not_trigger_rule(self):
         good, bad, noise = classify_25mv_ratio(49.9)
