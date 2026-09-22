@@ -4533,6 +4533,38 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
         text = str(value or "").strip().lower()
         return {"healthy": "good", "健康": "good", "坏道": "bad"}.get(text, text)
 
+    @staticmethod
+    def _snapshot_channel_ids(snapshot: dict, path: Path) -> set[int]:
+        """Identify the channel-ID coordinate system used by reviewed labels."""
+        values = snapshot.get("source_channel_ids", [])
+        if isinstance(values, (list, tuple)) and values:
+            try:
+                return {int(value) for value in values}
+            except (TypeError, ValueError):
+                pass
+        try:
+            with h5py.File(path, "r") as h5:
+                if "channel_ids" in h5:
+                    return {
+                        int(value) for value in np.asarray(h5["channel_ids"]).ravel()
+                    }
+        except (OSError, TypeError, ValueError):
+            pass
+        return set()
+
+    @staticmethod
+    def _reviewed_h5_has_remap(path: Path) -> bool:
+        try:
+            with h5py.File(path, "r") as h5:
+                provenance = read_h5_provenance(h5) or {}
+            return any(
+                isinstance(operation, dict)
+                and str(operation.get("name", "")).strip().lower() == "channel_remap"
+                for operation in provenance.get("operations", [])
+            )
+        except OSError:
+            return False
+
     @classmethod
     def _reference_from_snapshot(cls, path: Path, available_ids: set[int]):
         try:
@@ -4572,6 +4604,8 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
             "evaluated_ids": evaluated,
             "reference_bad_ids": reference_bad,
             "manual_overrides": manual,
+            "coordinate_channel_ids": cls._snapshot_channel_ids(snapshot, path),
+            "reviewed_h5_has_remap": cls._reviewed_h5_has_remap(path),
             "source": "H5内嵌QC人工复核结果（未载入处理数据）",
         }
 
@@ -4641,6 +4675,8 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                 "evaluated_ids": set(by_channel),
                 "reference_bad_ids": reference_bad,
                 "manual_overrides": manual,
+                "coordinate_channel_ids": cls._snapshot_channel_ids({}, path),
+                "reviewed_h5_has_remap": cls._reviewed_h5_has_remap(path),
                 "source": f"CSV人工复核结果:{candidate.name}",
             }
         return None
@@ -4652,6 +4688,56 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
             cls._reference_from_snapshot(path, available)
             or cls._reference_from_csv(path, available)
         )
+
+    @staticmethod
+    def _align_reference_to_mapping(reference, raw_channel_ids, mapping, target_channel_ids):
+        """Convert raw-ID review labels to their Excel H-column destinations."""
+        reference = dict(reference)
+        raw_ids = np.asarray(raw_channel_ids, dtype=np.int64).ravel()
+        destinations = np.asarray(mapping, dtype=np.int64).ravel()
+        if raw_ids.size != destinations.size:
+            raise ValueError("原始通道ID数量与Excel映射数量不一致。")
+        raw_set = {int(value) for value in raw_ids}
+        declared_ids = {
+            int(value) for value in reference.get("coordinate_channel_ids", set())
+        }
+        # A QC snapshot exported from the raw 512-column H5 declares exactly
+        # those physical IDs. A review performed after remapping declares the
+        # expanded/target channel set and must not be mapped a second time.
+        labels_use_raw_ids = (
+            bool(declared_ids)
+            and declared_ids == raw_set
+            and not bool(reference.get("reviewed_h5_has_remap", False))
+        )
+        reference["labels_remapped_from_raw"] = labels_use_raw_ids
+        if not labels_use_raw_ids:
+            reference["coordinate_system"] = "target"
+            return reference
+
+        valid_targets = {int(value) for value in target_channel_ids}
+        id_map = {
+            int(raw): int(target)
+            for raw, target in zip(raw_ids, destinations)
+            if int(target) in valid_targets
+        }
+
+        def mapped_set(values):
+            return {id_map[int(value)] for value in values if int(value) in id_map}
+
+        reference["evaluated_ids"] = mapped_set(reference["evaluated_ids"])
+        reference["reference_bad_ids"] = mapped_set(reference["reference_bad_ids"])
+        reference["manual_overrides"] = {
+            id_map[int(channel)]: result
+            for channel, result in reference.get("manual_overrides", {}).items()
+            if int(channel) in id_map
+        }
+        reference["coordinate_channel_ids"] = mapped_set(declared_ids)
+        reference["coordinate_system"] = "raw_mapped_to_target"
+        reference["source"] = (
+            str(reference.get("source", "人工复核结果"))
+            + "（审核ID已按Excel H列转换为目标通道ID）"
+        )
+        return reference
 
     @staticmethod
     def _metrics(predicted_bad: set[int], reference_bad: set[int], evaluated: set[int]):
@@ -4717,7 +4803,7 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                         str(path.resolve()), int(reviewed_stat.st_mtime_ns), int(reviewed_stat.st_size),
                         str(raw_path.resolve()), int(raw_stat.st_mtime_ns), int(raw_stat.st_size),
                         str(self.mapping_path.resolve()), int(mapping_stat.st_mtime_ns), int(mapping_stat.st_size),
-                        "reviewed_target_ids_520_v1",
+                        "reviewed_target_ids_520_v2_label_alignment",
                     )
                     cached_entry = self.data_cache.get(cache_key)
                     if cached_entry is not None:
@@ -4758,6 +4844,10 @@ class BadChannelParameterSweepWorker(CooperativeWorker):
                         mapped_ids = {int(value) for value in np.asarray(mapping).ravel()
                                       if 1 <= int(value) <= meta.channels}
                         reference = self._load_reference(path, meta)
+                        if reference is not None:
+                            reference = self._align_reference_to_mapping(
+                                reference, raw_ids, mapping, meta.channel_ids,
+                            )
                         if reference is not None:
                             self.data_cache[cache_key] = {
                                 "source": source, "reference": reference,
@@ -5004,7 +5094,7 @@ class BadChannelPairSweepWorker(BadChannelParameterSweepWorker):
             str(reviewed_path.resolve()), int(reviewed_stat.st_mtime_ns), int(reviewed_stat.st_size),
             str(raw_path), int(raw_stat.st_mtime_ns), int(raw_stat.st_size),
             str(self.mapping_path.resolve()), int(map_stat.st_mtime_ns), int(map_stat.st_size),
-            "reviewed_target_ids_520_v1",
+            "reviewed_target_ids_520_v2_label_alignment",
         )
         cached = self.data_cache.get(key)
         if cached is not None:
@@ -5037,6 +5127,9 @@ class BadChannelPairSweepWorker(BadChannelParameterSweepWorker):
         reference = self._load_reference(reviewed_path, source.metadata)
         if reference is None:
             raise ValueError("未找到可用的历史人工复核结果。")
+        reference = self._align_reference_to_mapping(
+            reference, ids, mapping, source.metadata.channel_ids,
+        )
         mapped_ids = {int(value) for value in np.asarray(mapping).ravel()
                       if 1 <= int(value) <= source.metadata.channels}
         self.data_cache[key] = {
@@ -14213,7 +14306,7 @@ class QtAnalysisGUI(QMainWindow):
         header_fill = PatternFill("solid", fgColor="1F4E78")
         header_font = Font(color="FFFFFF", bold=True)
         percent_headers = {
-            "坏道比例", "Precision", "Recall", "F1", "F2", "单文件最低Recall",
+            "坏道比例", "Precision", "Recall", "NPV", "F1", "F2", "单文件最低Recall",
         }
         for sheet in workbook.worksheets:
             sheet.freeze_panes = "A2"
@@ -14244,9 +14337,9 @@ class QtAnalysisGUI(QMainWindow):
         tn = sum(row["tn"] for row in rows)
         precision = tp / (tp + fp) if tp + fp else (1.0 if tp + fn == 0 else 0.0)
         recall = tp / (tp + fn) if tp + fn else 1.0
-        f2 = 5 * precision * recall / (4 * precision + recall) if 4 * precision + recall else 0.0
+        npv = tn / (tn + fn) if tn + fn else 1.0
         return dict(files=len(rows), tp=tp, fp=fp, fn=fn, tn=tn,
-                    precision=precision, recall=recall, f2=f2,
+                    precision=precision, recall=recall, npv=npv,
                     min_file_recall=min((row["recall"] for row in rows), default=0.0))
 
     @classmethod
@@ -14276,7 +14369,7 @@ class QtAnalysisGUI(QMainWindow):
             return None, "本次扫描范围没有数值同时达到总体 Recall≥98% 与每文件 Recall≥95%；不推荐达标参数。"
         baseline_value = float(result["base_settings"][result["parameter_key"]])
         chosen = max(qualified, key=lambda row: (
-            row["precision"], -row["fp"], row["f2"],
+            row["precision"], -row["fp"], row["npv"],
             -abs(row["value"] - baseline_value),
         ))
         return chosen, (
@@ -14315,18 +14408,18 @@ class QtAnalysisGUI(QMainWindow):
             summary.append(["基线 FP", baseline["fp"]])
             summary.append(["基线 FN", baseline["fn"]])
             table = workbook.create_sheet("参数汇总")
-            table.append(["参数值", "文件数", "TP", "FP", "FN", "TN", "Precision", "Recall", "F2",
+            table.append(["参数值", "文件数", "TP", "FP", "FN", "TN", "Precision", "Recall", "NPV",
                           "单文件最低Recall", "相对基线TP变化", "相对基线FP变化", "相对基线FN变化", "是否达标"])
             for value in result["values"]:
                 rows = [row for row in result["runs"] if row["scenario"] == "sweep" and row["value"] == value]
                 score = self._controlled_metric_summary(rows)
                 table.append([value, score["files"], score["tp"], score["fp"], score["fn"], score["tn"],
-                              score["precision"], score["recall"], score["f2"], score["min_file_recall"],
+                              score["precision"], score["recall"], score["npv"], score["min_file_recall"],
                               score["tp"]-baseline["tp"], score["fp"]-baseline["fp"],
                               score["fn"]-baseline["fn"],
                               "是" if score["recall"] >= .98 and score["min_file_recall"] >= .95 else "否"])
             detail = workbook.create_sheet("逐文件对照")
-            detail.append(["人工复核H5", "原始H5", "场景", "参数值", "评估通道", "排除映射空位",
+            detail.append(["人工复核H5", "原始H5", "场景", "参数值", "评估通道", "未纳入评估通道数",
                            "人工坏道", "TP", "FP", "FN", "TN", "Precision", "Recall", "预测坏道ID",
                            "相对基线漏掉的真坏道ID", "相对基线减少的误报ID",
                            "相对基线新增的真坏道ID", "相对基线新增的误报ID", "513～520 未复核目标ID"])
@@ -14405,7 +14498,7 @@ class QtAnalysisGUI(QMainWindow):
             note.append(["有效采样不足", "数据完整性保护条件始终保留，不作为可删除的坏道规则。"])
             note.append(["局限", "同批人工复核数据的回顾性结论；无独立增益不等于以后永远没用。"])
             detail = workbook.create_sheet("逐文件去除对照")
-            detail.append(["人工复核H5", "原始H5", "场景", "是否启用", "评估通道", "排除映射空位",
+            detail.append(["人工复核H5", "原始H5", "场景", "是否启用", "评估通道", "未纳入评估通道数",
                            "TP", "FP", "FN", "TN", "预测坏道ID", "去除后丢失真坏道ID", "去除后减少误报ID",
                            "去除后新增真坏道ID", "去除后新增误报ID"])
             for row in result["runs"]:
@@ -14964,7 +15057,7 @@ class QtAnalysisGUI(QMainWindow):
                 "predicted_bad_count",
             )])
         per_file = workbook.create_sheet("逐文件结果")
-        per_file.append(["人工复核H5", "原始H5", "第一参数", "第二参数", "评估通道", "排除映射空位",
+        per_file.append(["人工复核H5", "原始H5", "第一参数", "第二参数", "评估通道", "未纳入评估通道数",
                          "历史坏道", "预测坏道", "TP", "FP", "FN", "TN",
                          "Precision", "Recall", "F1", "F2", "预测坏道ID"])
         for row in result["runs"]:
@@ -15058,7 +15151,7 @@ class QtAnalysisGUI(QMainWindow):
             chosen.append(["2.5mV目标数值", self._bad_channel_pair_results["near_target"]["base_settings"].get(
                 "high_frequency_noise_target", "")])
             sheet = workbook.create_sheet("三组规则合并验证")
-            sheet.append(["文件", "原始H5", "评估通道", "排除映射空位", "人工坏道", "合并预测坏道",
+            sheet.append(["文件", "原始H5", "评估通道", "未纳入评估通道数", "人工坏道", "合并预测坏道",
                           "TP", "FP", "FN", "TN", "Precision", "Recall", "F1", "F2",
                           "平直坏道ID", "贴底坏道ID", "2.5mV坏道ID", "合并坏道ID"])
             for row in combined["rows"]:
