@@ -8116,7 +8116,7 @@ class QtAnalysisGUI(QMainWindow):
         remap_only = QPushButton("执行通道重映射")
         remap_only.clicked.connect(lambda: self.run_preprocess(force_filter_off=True))
         full_h5 = QPushButton("导入完整 H5 做预处理")
-        full_h5.clicked.connect(self.choose_file)
+        full_h5.clicked.connect(self.choose_full_h5)
         overview = QPushButton("选择滤波通道（总览）")
         overview.clicked.connect(self.open_preprocess_filter_overview)
         show_preprocess_params = QPushButton("显示参数")
@@ -9242,6 +9242,17 @@ class QtAnalysisGUI(QMainWindow):
         self.align_run_button = QPushButton("计算并刷新对齐")
         self.align_run_button.setObjectName("primaryAction")
         self.align_run_button.clicked.connect(self.run_alignment)
+        self.alignment_import_h5_button = QPushButton("导入完整 H5 预处理后结果")
+        self.alignment_import_h5_button.setObjectName("primaryAction")
+        self.alignment_import_h5_button.setToolTip("载入完整 H5，并恢复坏道判定、人工标记、处理步骤及文件定时信息。")
+        self.alignment_import_h5_button.clicked.connect(self.choose_full_h5)
+        import_alignment_row = QHBoxLayout()
+        for button in (self.alignment_import_h5_button, self.align_run_button):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            import_alignment_row.addWidget(button, 1)
+        import_alignment_holder = QWidget()
+        import_alignment_holder.setLayout(import_alignment_row)
         self.alignment_status = QLabel("加载 log.txt 与 Flash Event CSV 后生成 sample/tag 刺激标记。")
         self.alignment_status.setWordWrap(True)
         form.addRow("任务模式", self.alignment_task_mode_var)
@@ -9249,14 +9260,12 @@ class QtAnalysisGUI(QMainWindow):
         self.loaded_dt1_label.setWordWrap(True)
         self.loaded_dt1_label.setStyleSheet("color:#24516e; padding:2px 0;")
         form.addRow("文件 BIN 定时", self.loaded_dt1_label)
-        form.addRow(self.align_run_button)
+        form.addRow(import_alignment_holder)
         form.addRow(self.alignment_status)
         layout.addWidget(controls)
         action_row = QHBoxLayout()
         select = QPushButton("选择对齐 / Letter 通道（10×10 波形）")
         select.clicked.connect(self.choose_alignment_channels)
-        custom = QPushButton("导入自定义通道数据")
-        custom.clicked.connect(self.import_custom_channels)
         flash = QPushButton("Flash 任务")
         # Page 3 retains the legacy task plotting entry points.  They only
         # use aligned markers and never start LFP QC/PSD metrics.
@@ -9265,7 +9274,7 @@ class QtAnalysisGUI(QMainWindow):
         # Page 3 keeps the original Letter video/marker browser.  It uses
         # only aligned epochs and does not run LFP QC/PSD metrics.
         letter.clicked.connect(self._run_alignment_letter_browser)
-        for button in (select, custom, flash, letter): action_row.addWidget(button)
+        for button in (select, flash, letter): action_row.addWidget(button)
         next_alignment = QPushButton("下一步：检查时间对齐")
         next_alignment.clicked.connect(lambda: self._activate_page(3))
         action_row.addWidget(next_alignment)
@@ -18085,19 +18094,30 @@ class QtAnalysisGUI(QMainWindow):
         if Path(directory).is_dir():
             os.startfile(directory) if sys.platform.startswith("win") else None
 
-    def choose_file(self) -> None:
+    def choose_full_h5(self) -> None:
+        """Shared full-record H5 import for preprocessing and alignment pages."""
+        self.choose_file(full_h5=True)
+
+    def choose_file(self, *, full_h5: bool = False) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
-            "选择脑电 HDF5 / MAT 文件",
+            "选择完整 H5 数据或预处理后结果" if full_h5 else "选择脑电 HDF5 / MAT 文件",
             self.path_edit.text() or str(Path.cwd()),
-            "EEG files (*.h5 *.hdf5 *.mat);;HDF5 files (*.h5 *.hdf5);;MAT files (*.mat);;All files (*.*)",
+            "HDF5 files (*.h5 *.hdf5)" if full_h5
+            else "EEG files (*.h5 *.hdf5 *.mat);;HDF5 files (*.h5 *.hdf5);;MAT files (*.mat);;All files (*.*)",
         )
         if filename:
             # Selecting H5/MAT makes it the active import source instead of a
             # stale BIN path retained from an earlier operation.
             self.bin_path_edit.clear()
             self.path_edit.setText(filename)
-            self.load_file()
+            if full_h5:
+                self._load_file_use_full_range_once = True
+            try:
+                self.load_file()
+            finally:
+                if full_h5:
+                    self._load_file_use_full_range_once = False
 
     def load_file(self) -> None:
         try:
@@ -18117,6 +18137,24 @@ class QtAnalysisGUI(QMainWindow):
                 self.source = LazyH5Source()
                 meta = self.source.open(filename, start_seconds, duration_seconds)
             self.active_source = self.source
+            # Imported data replaces the previous task's signals and markers.
+            self.lfp_source = None
+            self.spike_source = None
+            self.lfp_selected_ids = set()
+            self.spike_selected_ids = set()
+            self._lfp_selection_explicit = False
+            self._invalidate_lfp_channel_dependent_results()
+            self.spike_rows = []
+            self._task_marker_source = None
+            for name in (
+                "stim_markers", "stim_marker_mode", "timing_info",
+                "behavior_matches", "behavior_detection_path",
+                "behavior_detection_events", "behavior_detection_frame_rate",
+                "behavior_detection_recording_time_sec", "behavior_detection_video_eeg_offset_sec",
+            ):
+                self.__dict__.pop(name, None)
+            if hasattr(self, "alignment_results"):
+                self.alignment_results.clear()
             # A pending extracted-channel repair belongs to the previously
             # loaded preprocessing H5 and must never carry across files.
             self._channel_repair_context = None
@@ -18201,6 +18239,19 @@ class QtAnalysisGUI(QMainWindow):
                 self._set_preprocess_data_state(
                     self.preprocess_data_state.text()
                     + " " + self._format_lfp_analysis_state(self._loaded_lfp_analysis_state)
+                )
+            if hasattr(self, "alignment_status"):
+                qc_text = (
+                    f"已恢复坏道判断：健康 {len(self.good_channel_ids)}、坏道 {len(self.bad_channel_ids)}、"
+                    f"人工标记 {len(self.manual_channel_overrides)}；"
+                    f"来源：{getattr(self, '_restored_qc_record_source', 'H5内嵌QC快照')}。"
+                    if restored_preprocess_qc else "文件未包含可恢复的坏道判断，请先完成坏道检查。"
+                )
+                self.alignment_status.setText(f"已导入 {filename.name}；{qc_text}")
+            if hasattr(self, "alignment_preview_channel_box"):
+                self._sync_preview_channel_box(
+                    self.alignment_preview_channel_box, self.source,
+                    allowed_channel_ids=self.good_channel_ids if restored_preprocess_qc else (),
                 )
             self.statusBar().showMessage("已加载 HDF5 元数据；预览仅按当前时间窗/通道切片读取。")
             self._update_file_banners()
