@@ -1642,12 +1642,15 @@ class PyQtGraphOverview(QMainWindow):
                  selection_mode: bool = False, selected_channel_ids=(), selection_callback=None,
                  selection_label: str = "ICA", display_channel_ids=None,
                  initial_display_channel_ids=None, display_scope_label: str = "",
-                 selection_groups=None):
+                 selection_groups=None, allow_raw_channel_export: bool = True,
+                 empty_selection_means_all: bool = False):
         super().__init__()
         if source.metadata is None:
             raise RuntimeError("Load an HDF5 source before opening the overview.")
         self.source = source
         self.selection_mode = bool(selection_mode)
+        self.allow_raw_channel_export = bool(allow_raw_channel_export)
+        self.empty_selection_means_all = bool(empty_selection_means_all)
         self.page = 0
         # Size a page from the available desktop rather than from a design
         # resolution. A 5x5 page is unreadable on a 1366x768 laptop and gets
@@ -1709,9 +1712,12 @@ class PyQtGraphOverview(QMainWindow):
                     [base_ids[channel] for channel in dict.fromkeys(initial_ids)], dtype=np.int64
                 )
         available_channel_ids = {int(value) for value in source_channel_ids}
+        selectable_channel_ids = {
+            int(source_channel_ids[column]) for column in self._base_display_columns
+        }
         self._selected_channel_ids = {
             int(channel) for channel in selected_channel_ids
-            if int(channel) in available_channel_ids
+            if int(channel) in selectable_channel_ids
         }
         self._selection_groups = {
             str(label): {int(channel) for channel in channel_ids if int(channel) in available_channel_ids}
@@ -1774,18 +1780,19 @@ class PyQtGraphOverview(QMainWindow):
             spin.editingFinished.connect(lambda: self.render_page(force=True))
         self._toggle_full_duration(self.full_duration_check.isChecked())
         controls.addStretch(1)
-        export_controls = QHBoxLayout()
-        self.raw_export_channels_edit = QLineEdit()
-        self.raw_export_channels_edit.setPlaceholderText("例如：7, 500, 20-26（实际通道号）")
-        self.raw_export_channels_edit.setMinimumWidth(260)
-        self.raw_export_directory_edit = QLineEdit(str(Path.cwd()))
-        self.raw_export_directory_edit.setReadOnly(True)
-        choose_directory = QPushButton("选择目录")
-        choose_directory.clicked.connect(self.choose_raw_export_directory)
-        self.raw_export_button = QPushButton("导出单通道 raw.h5")
-        self.raw_export_button.clicked.connect(self.export_selected_raw_channels)
-        self.raw_export_status = QLabel("按实际通道号导出；文件可重新导入预处理。")
-        self.raw_export_status.setWordWrap(True)
+        if self.allow_raw_channel_export:
+            export_controls = QHBoxLayout()
+            self.raw_export_channels_edit = QLineEdit()
+            self.raw_export_channels_edit.setPlaceholderText("例如：7, 500, 20-26（实际通道号）")
+            self.raw_export_channels_edit.setMinimumWidth(260)
+            self.raw_export_directory_edit = QLineEdit(str(Path.cwd()))
+            self.raw_export_directory_edit.setReadOnly(True)
+            choose_directory = QPushButton("选择目录")
+            choose_directory.clicked.connect(self.choose_raw_export_directory)
+            self.raw_export_button = QPushButton("导出单通道 raw.h5")
+            self.raw_export_button.clicked.connect(self.export_selected_raw_channels)
+            self.raw_export_status = QLabel("按实际通道号导出；文件可重新导入预处理。")
+            self.raw_export_status.setWordWrap(True)
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.setBackground("w")
         self.graphics.setMinimumHeight(300)
@@ -1851,6 +1858,9 @@ class PyQtGraphOverview(QMainWindow):
             select_controls.addWidget(QLabel(f"{self.selection_label} 通道（实际通道号）"))
             self.selection_channels_edit = QLineEdit()
             self.selection_channels_edit.setPlaceholderText("例如：7, 500, 20-26；点击小图也可勾选")
+            if self.empty_selection_means_all:
+                self.selection_channels_edit.setPlaceholderText("留空=全部健康通道；例如：7,20-26；点击小图也可勾选")
+                self.selection_channels_edit.setToolTip("仅接受本窗口列出的健康通道号；留空时使用全部健康通道。")
             self.selection_channels_edit.setMinimumWidth(420)
             self.selection_channels_edit.textChanged.connect(self._selection_text_changed)
             self.selection_summary = QLabel()
@@ -1887,13 +1897,14 @@ class PyQtGraphOverview(QMainWindow):
                 group_controls.addStretch(1)
                 layout.addLayout(group_controls)
             self._sync_selection_text()
-        for widget in (
-            QLabel("单通道导出"), self.raw_export_channels_edit,
-            self.raw_export_directory_edit, choose_directory, self.raw_export_button,
-        ):
-            export_controls.addWidget(widget)
-        layout.addLayout(export_controls)
-        layout.addWidget(self.raw_export_status)
+        if self.allow_raw_channel_export:
+            for widget in (
+                QLabel("单通道导出"), self.raw_export_channels_edit,
+                self.raw_export_directory_edit, choose_directory, self.raw_export_button,
+            ):
+                export_controls.addWidget(widget)
+            layout.addLayout(export_controls)
+            layout.addWidget(self.raw_export_status)
         layout.addWidget(self.graphics, 1)
         self.setCentralWidget(outer)
 
@@ -1930,7 +1941,10 @@ class PyQtGraphOverview(QMainWindow):
                 # Permit an unfinished edit such as a trailing comma without
                 # discarding selections already entered in the same field.
                 continue
-        available = {int(value) for value in self.source.metadata.channel_ids}
+        available = {
+            int(self.source.metadata.channel_ids[column])
+            for column in self._base_display_columns
+        }
         return requested & available
 
     def _requested_overview_columns(self, text: str) -> np.ndarray:
@@ -2016,26 +2030,40 @@ class PyQtGraphOverview(QMainWindow):
             self._selected_channel_ids.difference_update(group)
         self._sync_selection_text()
 
+    def _effective_selected_channel_ids(self) -> set[int]:
+        if self.empty_selection_means_all and not self.selection_channels_edit.text().strip():
+            return {
+                int(self.source.metadata.channel_ids[column])
+                for column in self._base_display_columns
+            }
+        return set(self._selected_channel_ids)
+
     def _refresh_selection_visuals(self) -> None:
         if not self.selection_mode:
             return
-        self.selection_summary.setText(f"已选择 {len(self._selected_channel_ids)} 个通道")
+        selected_ids = self._effective_selected_channel_ids()
+        default_all = self.empty_selection_means_all and not self.selection_channels_edit.text().strip()
+        self.selection_summary.setText(
+            f"默认全部健康通道：{len(selected_ids)} 个" if default_all
+            else f"已选择 {len(selected_ids)} 个通道"
+        )
         meta = self.source.metadata
         for plot, column in self._page_plots:
             channel_id = int(meta.channel_ids[column])
-            selected = channel_id in self._selected_channel_ids
+            selected = channel_id in selected_ids
             plot.setTitle(("✓ " if selected else "") + f"ch{channel_id}", size="9pt", color="#d32f2f" if selected else "#666666")
 
     def _confirm_selection(self) -> None:
-        if not self._selected_channel_ids:
+        selected_ids = self._effective_selected_channel_ids()
+        if not selected_ids:
             QMessageBox.information(self, f"未选择{self.selection_label}通道", "请点击波形或输入至少一个实际通道号。")
             return
-        if self.selection_label == "ICA" and len(self._selected_channel_ids) < 2:
+        if self.selection_label == "ICA" and len(selected_ids) < 2:
             QMessageBox.information(self, "ICA 通道不足", "ICA 至少需要选择两个通道。")
             return
         callback = self._selection_callback
         if callable(callback):
-            callback(sorted(self._selected_channel_ids))
+            callback(sorted(selected_ids))
         self.close()
 
     @property
@@ -2047,6 +2075,8 @@ class PyQtGraphOverview(QMainWindow):
         self.render_page()
 
     def choose_raw_export_directory(self) -> None:
+        if not self.allow_raw_channel_export:
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "选择单通道 raw.h5 保存目录", self.raw_export_directory_edit.text() or str(Path.cwd())
         )
@@ -2077,6 +2107,8 @@ class PyQtGraphOverview(QMainWindow):
         return requested
 
     def export_selected_raw_channels(self) -> None:
+        if not self.allow_raw_channel_export:
+            return
         if getattr(self, "_raw_channel_export_worker", None) is not None and self._raw_channel_export_worker.isRunning():
             return
         try:
@@ -9329,15 +9361,18 @@ class QtAnalysisGUI(QMainWindow):
         return holder
 
     @staticmethod
-    def _sync_preview_channel_box(channel_box, source) -> None:
+    def _sync_preview_channel_box(channel_box, source, *, allowed_channel_ids=None) -> None:
         """Populate the view selector with physical IDs without changing data state."""
         meta = getattr(source, "metadata", None)
         if meta is None:
             return
         selected_id = channel_box.currentData()
+        allowed = None if allowed_channel_ids is None else {int(channel) for channel in allowed_channel_ids}
         channel_box.blockSignals(True)
         channel_box.clear()
         for column, channel_id in enumerate(meta.channel_ids):
+            if allowed is not None and int(channel_id) not in allowed:
+                continue
             channel_box.addItem(f"ch{int(channel_id)}", column)
         if selected_id is not None:
             previous = channel_box.findData(selected_id)
@@ -9363,7 +9398,15 @@ class QtAnalysisGUI(QMainWindow):
         if not source.loaded:
             QMessageBox.information(self, "尚未加载数据", "请先加载脑电数据。")
             return
-        self._sync_preview_channel_box(self.alignment_preview_channel_box, source)
+        try:
+            healthy_ids = self._alignment_healthy_channel_ids(source)
+        except ValueError as exc:
+            self.alignment_preview_channel_box.clear()
+            QMessageBox.information(self, "对齐健康通道", str(exc))
+            return
+        self._sync_preview_channel_box(
+            self.alignment_preview_channel_box, source, allowed_channel_ids=healthy_ids,
+        )
         column = self.alignment_preview_channel_box.currentData()
         if column is None:
             return
@@ -9909,14 +9952,59 @@ class QtAnalysisGUI(QMainWindow):
         if filename:
             self.alignment_detection_edit.setText(filename)
 
+    def _alignment_healthy_channel_ids(self, source) -> set[int]:
+        """Allow only channels confirmed healthy by the latest completed QC."""
+        if not getattr(self, "_bad_channel_check_completed", False):
+            raise ValueError("请先完成或载入坏道判断结果，再选择对齐 / Letter 健康通道。")
+        available = {int(channel) for channel in source.metadata.channel_ids}
+        healthy = available & {int(channel) for channel in self.good_channel_ids}
+        healthy -= {int(channel) for channel in getattr(self, "bad_channel_ids", set())}
+        if not healthy:
+            raise ValueError("当前数据没有已确认的健康通道，无法进行对齐 / Letter 计算。")
+        return healthy
+
+    def _alignment_channel_ids(self, source) -> set[int]:
+        healthy = self._alignment_healthy_channel_ids(source)
+        selected = {int(channel) for channel in getattr(self, "alignment_selected_ids", set())}
+        if getattr(self, "_alignment_use_all_healthy", not bool(selected)):
+            return healthy
+        selected &= healthy
+        if not selected:
+            raise ValueError("原来选择的对齐通道已不属于当前健康通道，请重新选择或清空通道号。")
+        return selected
+
+    def _task_analysis_channel_ids(self, source) -> set[int]:
+        """Keep explicit page-4 choices while applying the same healthy scope."""
+        selected = {int(channel) for channel in getattr(self, "lfp_selected_ids", set())}
+        if selected and (
+            getattr(self, "_lfp_selection_explicit", False)
+            or getattr(self, "lfp_source", None) is not None
+        ):
+            selected &= self._alignment_healthy_channel_ids(source)
+            if not selected:
+                raise ValueError("已选任务通道中没有当前健康通道，请重新选择。")
+            return selected
+        return self._alignment_channel_ids(source)
+
     def choose_alignment_channels(self) -> bool:
         if not self.active_source.loaded:
             QMessageBox.information(self, "尚未加载数据", "请先加载 HDF5 数据文件。")
             return False
+        try:
+            healthy_ids = self._alignment_healthy_channel_ids(self.active_source)
+        except ValueError as exc:
+            QMessageBox.information(self, "对齐健康通道", str(exc))
+            return False
+        selected_ids = set(getattr(self, "alignment_selected_ids", set()))
+        use_all = getattr(self, "_alignment_use_all_healthy", not bool(selected_ids))
         selector = getattr(self, "_alignment_channel_selector", None)
         if selector is not None:
             try:
-                if selector.isVisible() and selector.source is self.active_source:
+                selector_scope = {
+                    int(selector.source.metadata.channel_ids[column])
+                    for column in selector._base_display_columns
+                }
+                if selector.isVisible() and selector.source is self.active_source and selector_scope == healthy_ids:
                     selector.raise_()
                     selector.activateWindow()
                     return False
@@ -9929,19 +10017,35 @@ class QtAnalysisGUI(QMainWindow):
             0.0,
             min(5.0, self.active_source.metadata.rows / self.active_source.metadata.fs),
             selection_mode=True,
-            selected_channel_ids=getattr(self, "alignment_selected_ids", set()),
-            selection_callback=self._set_alignment_selected_channels,
+            selected_channel_ids=() if use_all else selected_ids & healthy_ids,
+            selection_callback=lambda ids: self._set_alignment_selected_channels(
+                ids, use_all_healthy=not selector.selection_channels_edit.text().strip(),
+            ),
             selection_label="对齐 / Letter",
+            display_channel_ids=healthy_ids,
+            display_scope_label="健康通道",
+            allow_raw_channel_export=False,
+            empty_selection_means_all=True,
         )
         selector.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         selector.showMaximized()
         self._alignment_channel_selector = selector
         return False
 
-    def _set_alignment_selected_channels(self, channel_ids) -> None:
-        self.alignment_selected_ids = {int(channel) for channel in channel_ids}
+    def _set_alignment_selected_channels(self, channel_ids, *, use_all_healthy: bool = False) -> None:
+        try:
+            healthy = self._alignment_healthy_channel_ids(self.active_source)
+        except ValueError as exc:
+            QMessageBox.information(self, "对齐健康通道", str(exc))
+            return
+        selected = healthy if use_all_healthy else {int(channel) for channel in channel_ids} & healthy
+        if not selected:
+            QMessageBox.information(self, "对齐健康通道", "所选通道已不属于当前健康通道，请重新选择。")
+            return
+        self._alignment_use_all_healthy = bool(use_all_healthy)
+        self.alignment_selected_ids = selected
         self.alignment_status.setText(
-            f"已选择 {len(self.alignment_selected_ids)} 个对齐 / Letter 通道；"
+            f"{'默认使用全部' if use_all_healthy else '已选择'} {len(selected)} 个对齐 / Letter 健康通道；"
             "后续 Flash 和 Letter 任务将使用这组通道。"
         )
         self._update_file_banners()
@@ -9964,8 +10068,12 @@ class QtAnalysisGUI(QMainWindow):
         if not self.active_source.loaded:
             QMessageBox.information(self, "尚未加载数据", "请先加载 HDF5 数据文件。")
             return
-        if not getattr(self, "alignment_selected_ids", set()):
-            QMessageBox.information(self, "未选择对齐通道", "请先点击“选择对齐通道”，在 10×10 波形窗口中勾选通道并确认。")
+        try:
+            if not hasattr(self, "_alignment_use_all_healthy"):
+                self._alignment_use_all_healthy = not bool(getattr(self, "alignment_selected_ids", set()))
+            self.alignment_selected_ids = self._alignment_channel_ids(self.active_source)
+        except ValueError as exc:
+            QMessageBox.information(self, "对齐健康通道", str(exc))
             return
         log_path = self.alignment_log_edit.text().strip()
         event_path = self.alignment_event_edit.text().strip()
@@ -10023,7 +10131,7 @@ class QtAnalysisGUI(QMainWindow):
                     f"\n视频检测：帧率={frame_rate:g} Hz；匹配={len(behavior_matches)} 个\n"
                     f"首个 Letter trial 校准：marker sample={next(iter(behavior_matches))}，"
                     f"tag={first['tag']}；StartFrame={first['start_frame']}；"
-                    f"视频→EEG 偏移={first['video_eeg_offset_sec']:+.6f} s；"
+                    f"视频偏移={first['video_eeg_offset_sec']:+.6f} s；"
                     f"StartFrame 相对 marker={first['visual_start_latency_sec'] * 1000.0:+.3f} ms\n"
                     "说明：StartFrame 仅用于视觉对齐检查；有效 AnimalStart 仅作为行为参考。"
                 )
@@ -10038,12 +10146,19 @@ class QtAnalysisGUI(QMainWindow):
                 + behavior_text + "\n\n"
                 + "前十个 [sample, tag]：\n" + np.array2string(markers[:10], separator=", ")
             )
-            self._sync_preview_channel_box(self.alignment_preview_channel_box, self.active_source)
+            self._sync_preview_channel_box(
+                self.alignment_preview_channel_box, self.active_source,
+                allowed_channel_ids=self._alignment_healthy_channel_ids(self.active_source),
+            )
             ids = self.active_source.metadata.channel_ids
             preferred = next((index for index, channel_id in enumerate(ids) if channel_id in self.alignment_selected_ids), 0)
-            self.alignment_preview_channel_box.setCurrentIndex(preferred)
+            self.alignment_preview_channel_box.setCurrentIndex(
+                self.alignment_preview_channel_box.findData(preferred)
+            )
             self.refresh_alignment_channel_preview()
-            self.alignment_status.setText(f"对齐完成：{markers.shape[0]} 个刺激标记。")
+            self.alignment_status.setText(
+                f"对齐完成：{markers.shape[0]} 个刺激标记；使用 {len(self.alignment_selected_ids)} 个健康通道。"
+            )
             self._inherit_alignment_selection_for_lfp()
             self._update_file_banners()
         except Exception as exc:
@@ -11169,7 +11284,7 @@ class QtAnalysisGUI(QMainWindow):
                 )
             if self.external_baseline_min_valid_spin.value() > self.external_baseline_candidate_spin.value():
                 raise ValueError("最少合格片段数不能大于每长度候选片段数。")
-            selected_ids = set(getattr(self, "lfp_selected_ids", set())) or set(getattr(self, "alignment_selected_ids", set()))
+            selected_ids = self._task_analysis_channel_ids(task_source)
             task_columns = np.flatnonzero(np.isin(task_source.metadata.channel_ids, sorted(selected_ids)))
             if not task_columns.size:
                 raise ValueError("请先选择至少一个用于 LFP 任务分析的通道。")
@@ -11667,9 +11782,7 @@ class QtAnalysisGUI(QMainWindow):
         if mode not in {"Flash", "Letter"}:
             raise ValueError("当前 marker 没有有效的 Flash 或 Letter 模式。")
         source = self.lfp_source or self.active_source
-        alignment_ids = set(getattr(self, "lfp_selected_ids", set())) or set(getattr(self, "alignment_selected_ids", set()))
-        if not alignment_ids:
-            raise ValueError("请先在时间对齐页选择至少一个对齐通道。")
+        alignment_ids = self._task_analysis_channel_ids(source)
         columns = np.flatnonzero(np.isin(source.metadata.channel_ids, sorted(alignment_ids)))
         if not columns.size:
             raise ValueError("当前对齐通道不在 LFP 数据源中。")
@@ -11749,9 +11862,7 @@ class QtAnalysisGUI(QMainWindow):
             # A page-4 LFP selection is authoritative for every LFP task
             # operation.  If it is empty, retain the alignment-page selection
             # as the compatibility fallback.
-            alignment_ids = set(getattr(self, "lfp_selected_ids", set())) or set(getattr(self, "alignment_selected_ids", set()))
-            if not alignment_ids:
-                raise ValueError("请先在时间对齐页选择并确认至少一个对齐 / Letter 通道。")
+            alignment_ids = self._task_analysis_channel_ids(source)
             columns = np.flatnonzero(np.isin(source.metadata.channel_ids, sorted(alignment_ids)))
             if not columns.size:
                 raise ValueError("已选对齐通道不在当前任务数据源中；请重新选择或导入对应通道数据。")
@@ -12495,7 +12606,7 @@ class QtAnalysisGUI(QMainWindow):
         controls.addWidget(timing_button); layout.addLayout(controls)
         frame_rate = getattr(self, "behavior_detection_frame_rate", np.nan)
         offset = getattr(self, "behavior_detection_video_eeg_offset_sec", np.nan)
-        info = QLabel(f"红虚线=Letter onset；绿点线=StartFrame；橙虚线=EndFrame；紫点划线=有效 AnimalStart。首个 Letter trial 校准；帧率={frame_rate:g} Hz；视频-EEG 偏移={offset:+.6f} s")
+        info = QLabel(f"红虚线=Letter onset；绿点线=StartFrame；橙虚线=EndFrame；紫点划线=有效 AnimalStart。首个 Letter trial 校准；帧率={frame_rate:g} Hz；视频偏移={offset:+.6f} s")
         info.setWordWrap(True); layout.addWidget(info)
         grid_holder = QWidget(window); grid = QGridLayout(grid_holder); grid.setContentsMargins(0, 0, 0, 0); grid.setSpacing(5)
         layout.addWidget(grid_holder, 1)
@@ -18009,6 +18120,8 @@ class QtAnalysisGUI(QMainWindow):
             # A pending extracted-channel repair belongs to the previously
             # loaded preprocessing H5 and must never carry across files.
             self._channel_repair_context = None
+            self.alignment_selected_ids = set()
+            self._alignment_use_all_healthy = True
             self.__dict__.pop("_channel_repair_base_state_text", None)
             self.__dict__.pop("_extracted_channel_preview_source", None)
             if hasattr(self, "preprocess_filter_channels_var"):
