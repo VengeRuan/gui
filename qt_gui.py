@@ -12,6 +12,7 @@ two widget toolkits are never placed in one event loop.
 from __future__ import annotations
 
 import sys
+import inspect
 import json
 import html
 import re
@@ -2971,6 +2972,18 @@ class PreprocessWorker(QThread):
                         },
                     ),
                 )
+            # Older installations may still load a filter implementation
+            # without parallel options.  Keep preprocessing compatible with
+            # that API while retaining the current two-thread path.
+            filter_parameters = inspect.signature(filter_array).parameters
+            parallel_options = {
+                name: value
+                for name, value in {
+                    "parallel_workers": 2,
+                    "parallel_memory_budget_bytes": 512 * 1024 * 1024,
+                }.items()
+                if name in filter_parameters
+            }
             processed, processed_cache = filter_array(
                 working_data,
                 meta.fs,
@@ -2991,8 +3004,7 @@ class PreprocessWorker(QThread):
                 # Ordinary “执行滤波” uses one extra compute thread while all
                 # writes remain on this preprocessing worker.  filter_array
                 # automatically falls back to one thread for large records.
-                parallel_workers=2,
-                parallel_memory_budget_bytes=512 * 1024 * 1024,
+                **parallel_options,
             )
             processed_source = (
                 working_source
@@ -5713,98 +5725,6 @@ class LeaveOneOutMedianCARWorker(CooperativeWorker):
             self.failed.emit(str(exc))
 
 
-def evaluate_task_trial_window_quality(
-    epoch: np.ndarray,
-    fs: float,
-    epoch_start_ms: float,
-    *,
-    flat_epsilon: float = 1e-4,
-    flat_ratio_percent: float = 30.0,
-    flat_ptp: float = 0.01,
-    available_ratio: float = 0.995,
-    saturation_run_samples: int = 8,
-    jump_mad_multiplier: float = 12.0,
-    jump_median_multiplier: float = 8.0,
-    jump_flat_floor_multiplier: float = 10.0,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Return the 5-window trial-quality decision for every channel.
-
-    Task response analysis uses the five 1 s windows from 0.5 to 5.5 s after
-    the marker.  This intentionally has no PSD/Welch call: all checks are
-    vectorized over ``(window, sample, channel)`` so a large trial set remains
-    bounded by the HDF5 slices that are already needed for epoching.
-    """
-    values = np.asarray(epoch, dtype=np.float32)
-    if values.ndim != 2:
-        raise ValueError("Task epoch must be a time x channel array.")
-    channels = values.shape[1]
-    samples_per_window = max(1, int(round(float(fs))))
-    first = int(round((500.0 - float(epoch_start_ms)) * float(fs) / 1000.0))
-    # A short task epoch is valid for short-latency responses.  It must not,
-    # however, turn the missing tail of the prescribed five-window QC region
-    # into false "clean" evidence.  Assess every complete 1 s window that is
-    # actually present and mark the remaining windows unavailable.
-    bounds = [
-        (first + number * samples_per_window, first + (number + 1) * samples_per_window)
-        for number in range(5)
-    ]
-    present = [number for number, (left, right) in enumerate(bounds) if left >= 0 and right <= values.shape[0]]
-    clean = np.zeros((5, channels), dtype=bool)
-    available = np.zeros((5, channels), dtype=bool)
-    saturated = np.zeros((5, channels), dtype=bool)
-    flat = np.zeros((5, channels), dtype=bool)
-    jump = np.zeros((5, channels), dtype=bool)
-    if not present:
-        return clean, {
-            "clean": clean, "available": available, "saturated": saturated,
-            "flat": flat, "jump": jump, "unavailable": ~available,
-        }
-
-    windows = np.stack([values[bounds[number][0]:bounds[number][1]] for number in present])
-    finite_ratio = np.mean(np.isfinite(windows), axis=1)
-    present_available = finite_ratio >= float(available_ratio)
-    finite_windows = np.where(np.isfinite(windows), windows, np.nan)
-    with np.errstate(all="ignore"):
-        ptp = np.nanmax(finite_windows, axis=1) - np.nanmin(finite_windows, axis=1)
-        differences = np.diff(finite_windows, axis=1)
-        abs_differences = np.abs(differences)
-        flat_ratio = np.mean(abs_differences <= abs(float(flat_epsilon)), axis=1) * 100.0
-        difference_median = np.nanmedian(abs_differences, axis=1)
-        difference_mad = np.nanmedian(
-            np.abs(abs_differences - difference_median[:, None, :]), axis=1
-        )
-        max_difference = np.nanmax(abs_differences, axis=1)
-
-    # A digitizer clipping plateau is represented by a configurable run of
-    # identical adjacent samples.  The default of eight avoids flagging an
-    # ordinary quantized crossing while still catching a clipped segment.
-    identical = np.isfinite(differences) & (np.abs(differences) <= np.finfo(np.float32).eps)
-    present_saturated = np.zeros((len(present), channels), dtype=bool)
-    run_differences = max(1, int(saturation_run_samples) - 1)
-    if identical.shape[1] >= run_differences:
-        runs = np.lib.stride_tricks.sliding_window_view(identical, run_differences, axis=1)
-        present_saturated = np.any(np.all(runs, axis=-1), axis=1)
-    present_flat = (ptp < abs(float(flat_ptp))) | (flat_ratio >= float(flat_ratio_percent))
-    # A robust within-window threshold avoids mistaking ordinary high-rate
-    # recording noise for a jump, while being insensitive to signal offset.
-    jump_threshold = difference_median + np.maximum(
-        float(jump_mad_multiplier) * difference_mad,
-        np.maximum(
-            float(jump_median_multiplier) * difference_median,
-            abs(float(flat_epsilon)) * float(jump_flat_floor_multiplier),
-        ),
-    )
-    present_jump = max_difference > jump_threshold
-    present_clean = present_available & ~present_saturated & ~present_flat & ~present_jump
-    clean[present] = present_clean
-    available[present] = present_available
-    saturated[present] = present_saturated
-    flat[present] = present_flat
-    jump[present] = present_jump
-    return clean, {
-        "clean": clean, "available": available, "saturated": saturated,
-        "flat": flat, "jump": jump, "unavailable": ~available,
-    }
 
 
 def compute_task_window_spectral_metrics(
@@ -5840,8 +5760,7 @@ def compute_task_window_spectral_metrics(
     taper = np.hanning(samples)
     basis = taper[:, None] * np.exp(-2j * np.pi * sample_time[:, None] * frequencies[None, :])
     # The coherent-gain scaling reports sine-wave mean-square power.  Invalid
-    # samples are made zero here; their windows are excluded by the QC mask
-    # before any aggregate is calculated.
+    # samples are made zero here before the spectral estimate is calculated.
     coefficients = np.einsum(
         "wsc,sf->wfc", np.nan_to_num(values, nan=0.0), basis,
         optimize=True,
@@ -5850,11 +5769,6 @@ def compute_task_window_spectral_metrics(
     return power[:, target_index, :], np.nanmean(power[:, noise_indices, :], axis=1)
 
 
-def _contiguous_true_runs(flags: np.ndarray) -> list[tuple[int, int]]:
-    """Return half-open index runs for a short one-dimensional boolean mask."""
-    padded = np.r_[False, np.asarray(flags, dtype=bool), False]
-    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
-    return [(int(first), int(last)) for first, last in edges.reshape(-1, 2)]
 
 
 def _continuous_segment_psd_metrics(
@@ -5888,124 +5802,43 @@ def _continuous_segment_psd_metrics(
 
 def compute_task_continuous_psd_metrics(
     epoch: np.ndarray,
-    clean_windows: np.ndarray,
-    usable_channels: np.ndarray,
     fs: float,
     epoch_start_ms: float,
     target_freq_hz: float,
     neighbor_bins: int = 4,
-    min_run_windows: int = 2,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute task PSD only from naturally contiguous clean one-second runs.
+    """Use the continuous 0.5–5.5 s steady interval, without artifact-window QC.
 
-    A trial can pass the 3/5 quality rule with separated clean windows.  Those
-    windows are deliberately never joined.  Instead, every run such as W2-W4
-    gets its own Welch PSD, and target/noise powers are duration-weighted over
-    the run PSDs.  Channels sharing the same five-window mask are processed
-    together, limiting the work to at most 32 mask groups per trial.
+    The original Welch estimator, minimum 2 s duration and duration weighting
+    are unchanged. A short epoch uses its actual intersection with this range.
     """
     values = np.asarray(epoch, dtype=np.float32)
-    clean = np.asarray(clean_windows, dtype=bool) & np.asarray(usable_channels, dtype=bool)[None, :]
-    if values.ndim != 2 or clean.shape != (5, values.shape[1]):
-        raise ValueError("Task PSD quality mask must be 5 x channel.")
-    samples_per_window = max(1, int(round(float(fs))))
-    steady_first = int(round((500.0 - float(epoch_start_ms)) * float(fs) / 1000.0))
+    if values.ndim != 2:
+        raise ValueError("Task epoch must be a time x channel array.")
     channels = values.shape[1]
-    target_sum = np.zeros(channels, dtype=np.float64)
-    noise_sum = np.zeros(channels, dtype=np.float64)
-    sample_counts = np.zeros(channels, dtype=np.int64)
-    segment_counts = np.zeros(channels, dtype=np.int64)
-    patterns = np.sum(clean * (1 << np.arange(5, dtype=np.int8))[:, None], axis=0)
-    for pattern in np.unique(patterns):
-        if not pattern:
-            continue
-        columns = np.flatnonzero(patterns == pattern)
-        flags = ((int(pattern) >> np.arange(5)) & 1).astype(bool)
-        for first_window, last_window in _contiguous_true_runs(flags):
-            if last_window - first_window < max(2, int(min_run_windows)):
-                continue
-            first = steady_first + first_window * samples_per_window
-            last = steady_first + last_window * samples_per_window
-            if first < 0 or last > values.shape[0]:
-                continue
-            target_power, noise_power = _continuous_segment_psd_metrics(
-                values[first:last, columns], fs, target_freq_hz, neighbor_bins,
-            )
-            weight = last - first
-            target_sum[columns] += target_power * weight
-            noise_sum[columns] += noise_power * weight
-            sample_counts[columns] += weight
-            segment_counts[columns] += 1
-    return (
-        np.divide(target_sum, sample_counts, out=np.full(channels, np.nan), where=sample_counts > 0),
-        np.divide(noise_sum, sample_counts, out=np.full(channels, np.nan), where=sample_counts > 0),
-        sample_counts,
-        segment_counts,
-    )
+    first = max(0, int(round((500.0 - float(epoch_start_ms)) * fs / 1000.0)))
+    last = min(values.shape[0], int(round((5500.0 - float(epoch_start_ms)) * fs / 1000.0)))
+    samples = max(0, last - first)
+    if samples < max(3, int(round(2.0 * fs))):
+        return (np.full(channels, np.nan), np.full(channels, np.nan),
+                np.zeros(channels, dtype=np.int64), np.zeros(channels, dtype=np.int64))
+    target, noise = _continuous_segment_psd_metrics(values[first:last], fs, target_freq_hz, neighbor_bins)
+    return target, noise, np.full(channels, samples, dtype=np.int64), np.ones(channels, dtype=np.int64)
 
 
 def compute_task_psd_metrics_by_run_length(
     epoch: np.ndarray,
-    clean_windows: np.ndarray,
-    usable_channels: np.ndarray,
     fs: float,
     epoch_start_ms: float,
     target_freq_hz: float,
     neighbor_bins: int = 4,
     run_lengths: tuple[int, ...] = (3, 4, 5),
 ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Return PSD aggregates separately for exact contiguous clean-window lengths.
-
-    This is intentionally narrower than ``compute_task_continuous_psd_metrics``:
-    it exists only to pair a task run with an external resting baseline of the
-    same duration.  Failed windows are never joined across a gap.
-    """
-    values = np.asarray(epoch, dtype=np.float32)
-    clean = np.asarray(clean_windows, dtype=bool) & np.asarray(usable_channels, dtype=bool)[None, :]
-    if values.ndim != 2 or clean.shape != (5, values.shape[1]):
-        raise ValueError("Task PSD quality mask must be 5 x channel.")
-    lengths = tuple(sorted({int(length) for length in run_lengths if 2 <= int(length) <= 5}))
-    channels = values.shape[1]
-    sums = {
-        length: (
-            np.zeros(channels, dtype=np.float64), np.zeros(channels, dtype=np.float64),
-            np.zeros(channels, dtype=np.int64), np.zeros(channels, dtype=np.int64),
-        )
-        for length in lengths
-    }
-    samples_per_window = max(1, int(round(float(fs))))
-    steady_first = int(round((500.0 - float(epoch_start_ms)) * float(fs) / 1000.0))
-    patterns = np.sum(clean * (1 << np.arange(5, dtype=np.int8))[:, None], axis=0)
-    for pattern in np.unique(patterns):
-        if not pattern:
-            continue
-        columns = np.flatnonzero(patterns == pattern)
-        flags = ((int(pattern) >> np.arange(5)) & 1).astype(bool)
-        for first_window, last_window in _contiguous_true_runs(flags):
-            length = last_window - first_window
-            if length not in sums:
-                continue
-            first = steady_first + first_window * samples_per_window
-            last = steady_first + last_window * samples_per_window
-            if first < 0 or last > values.shape[0]:
-                continue
-            target_power, noise_power = _continuous_segment_psd_metrics(
-                values[first:last, columns], fs, target_freq_hz, neighbor_bins,
-            )
-            target_sum, noise_sum, sample_counts, segment_counts = sums[length]
-            weight = last - first
-            target_sum[columns] += target_power * weight
-            noise_sum[columns] += noise_power * weight
-            sample_counts[columns] += weight
-            segment_counts[columns] += 1
-    return {
-        length: (
-            np.divide(target_sum, sample_counts, out=np.full(channels, np.nan), where=sample_counts > 0),
-            np.divide(noise_sum, sample_counts, out=np.full(channels, np.nan), where=sample_counts > 0),
-            sample_counts, segment_counts,
-        )
-        for length, (target_sum, noise_sum, sample_counts, segment_counts) in sums.items()
-    }
+    """Keep external-baseline length matching, without any clean-window mask."""
+    metrics = compute_task_continuous_psd_metrics(epoch, fs, epoch_start_ms, target_freq_hz, neighbor_bins)
+    samples = int(metrics[2][0]) if metrics[2].size else 0
+    return {int(length): metrics for length in run_lengths
+            if samples > 0 and samples == int(round(int(length) * fs))}
 
 
 def _stratified_nonoverlapping_starts(
@@ -6038,9 +5871,9 @@ def compute_external_baseline_reference(
 ) -> dict:
     """Build robust, length-matched 3/4/5 s resting-baseline references.
 
-    Each candidate is a natural continuous HDF5 slice.  QC uses the same
-    five-window thresholds as the task path, and each valid segment receives
-    an independent Welch estimate before median aggregation.
+    Each candidate is a natural continuous HDF5 slice and receives an
+    independent Welch estimate before median aggregation. No artifact-window
+    decision is required; non-finite samples remain a numerical safeguard.
     """
     meta = source.metadata
     columns = np.asarray(baseline_columns, dtype=np.int64)
@@ -6073,16 +5906,6 @@ def compute_external_baseline_reference(
             kernel = np.ones(width, dtype=np.float32) / width
             values = np.apply_along_axis(lambda item: np.convolve(item, kernel, mode="same"), 0, values)
 
-    quality_settings = {
-        "flat_epsilon": float(settings["quality_flat_epsilon"]),
-        "flat_ratio_percent": float(settings["quality_flat_ratio_percent"]),
-        "flat_ptp": float(settings["quality_flat_ptp"]),
-        "available_ratio": float(settings["quality_available_ratio"]),
-        "saturation_run_samples": int(settings["quality_saturation_run_samples"]),
-        "jump_mad_multiplier": float(settings["quality_jump_mad_multiplier"]),
-        "jump_median_multiplier": float(settings["quality_jump_median_multiplier"]),
-        "jump_flat_floor_multiplier": float(settings["quality_jump_flat_floor_multiplier"]),
-    }
     rng = np.random.default_rng(int(settings.get("baseline_random_seed", 20260817)))
     baseline_ids = [int(meta.channel_ids[index]) for index in columns]
     references = {}
@@ -6091,13 +5914,11 @@ def compute_external_baseline_reference(
         starts = _stratified_nonoverlapping_starts(meta.rows, samples, candidate_count, rng)
         target_values, noise_values = [], []
         valid_counts = np.zeros(columns.size, dtype=np.int64)
-        rejected = {name: np.zeros(columns.size, dtype=np.int64) for name in ("unavailable", "saturated", "flat", "jump")}
+        rejected = {"nonfinite": np.zeros(columns.size, dtype=np.int64)}
         for segment_index, start in enumerate(starts, start=1):
             segment = values[start:start + samples]
-            clean, quality = evaluate_task_trial_window_quality(segment, fs, 500.0, **quality_settings)
-            valid = np.all(clean[:length], axis=0)
-            for name in rejected:
-                rejected[name] += np.any(quality[name][:length], axis=0)
+            valid = np.all(np.isfinite(segment), axis=0)
+            rejected["nonfinite"] += ~valid
             target, noise = _continuous_segment_psd_metrics(
                 segment, fs, float(settings["task_target_freq_hz"]), int(settings["task_neighbor_bins"]),
             )
@@ -6152,18 +5973,13 @@ def compute_external_baseline_reference(
         starts = _stratified_nonoverlapping_starts(meta.rows, epoch_samples, candidate_count, rng)
         traces = np.full((starts.size, response_indices.size, columns.size), np.nan, dtype=np.float32)
         valid_counts = np.zeros(columns.size, dtype=np.int64)
-        rejected = {name: np.zeros(columns.size, dtype=np.int64) for name in ("unavailable", "saturated", "flat", "jump", "response_missing")}
+        rejected = {"response_missing": np.zeros(columns.size, dtype=np.int64)}
         for segment_index, start in enumerate(starts, start=1):
             epoch = values[start:start + epoch_samples]
-            clean, quality = evaluate_task_trial_window_quality(epoch, fs, epoch_start, **quality_settings)
-            available_windows = np.sum(quality["available"], axis=0)
-            usable = (available_windows > 0) & (np.sum(clean, axis=0) >= np.minimum(3, available_windows))
-            finite_response = np.mean(np.isfinite(epoch[response_mask]), axis=0) >= float(quality_settings["available_ratio"])
-            finite_baseline = np.mean(np.isfinite(epoch[baseline_mask]), axis=0) >= float(quality_settings["available_ratio"])
-            valid = usable & finite_response & finite_baseline
-            for name in ("unavailable", "saturated", "flat", "jump"):
-                rejected[name] += np.any(quality[name], axis=0)
-            rejected["response_missing"] += ~(finite_response & finite_baseline)
+            finite_response = np.all(np.isfinite(epoch[response_mask]), axis=0)
+            finite_baseline = np.all(np.isfinite(epoch[baseline_mask]), axis=0)
+            valid = finite_response & finite_baseline
+            rejected["response_missing"] += ~valid
             corrected = epoch - np.nanmean(epoch[baseline_mask], axis=0, keepdims=True)
             traces[segment_index - 1] = np.where(valid[None, :], corrected[response_indices], np.nan)
             valid_counts += valid
@@ -6439,23 +6255,11 @@ class TaskEpochWorker(QThread):
             )
             configured_a = max(0, int(self.settings.get("compare_trial_a", 0)))
             configured_b = max(0, int(self.settings.get("compare_trial_b", 0)))
-            quality_settings = {
-                "flat_epsilon": float(self.settings.get("quality_flat_epsilon", 1e-4)),
-                "flat_ratio_percent": float(self.settings.get("quality_flat_ratio_percent", 30.0)),
-                "flat_ptp": float(self.settings.get("quality_flat_ptp", 0.01)),
-                "available_ratio": float(self.settings.get("quality_available_ratio", .995)),
-                "saturation_run_samples": int(self.settings.get("quality_saturation_run_samples", 8)),
-                "jump_mad_multiplier": float(self.settings.get("quality_jump_mad_multiplier", 12.0)),
-                "jump_median_multiplier": float(self.settings.get("quality_jump_median_multiplier", 8.0)),
-                "jump_flat_floor_multiplier": float(self.settings.get("quality_jump_flat_floor_multiplier", 10.0)),
-            }
             target_frequency = float(self.settings.get("task_target_freq_hz", 1.0))
             local_neighbor_bins = max(1, int(self.settings.get("task_neighbor_bins", 4)))
             # Direct worker callers are historically LFP task callers;
             # the Spike page explicitly passes False below.
             lfp_task_metrics = bool(self.settings.get("lfp_task_metrics", True))
-            quality_only = bool(self.settings.get("quality_only", False))
-            precomputed_trial_quality = self.settings.get("precomputed_trial_quality") or {}
             external_baseline_reference = self.settings.get("external_baseline_reference") or None
             external_baseline_by_length = {}
             external_time_reference = None
@@ -6479,7 +6283,7 @@ class TaskEpochWorker(QThread):
                         eligible[channel_index] = bool(reference["eligible"][baseline_index])
                     external_baseline_by_length[int(length)] = (target, noise, valid_count, eligible)
                 candidate_time_reference = external_baseline_reference.get("time_reference")
-                if candidate_time_reference is not None and lfp_task_metrics and not quality_only:
+                if candidate_time_reference is not None and lfp_task_metrics:
                     reference_time_ms = np.asarray(candidate_time_reference.get("time_ms"), dtype=float)
                     reference_rate_hz = float(candidate_time_reference.get("sample_rate_hz", 0.0))
                     time_step = max(1, int(round(meta.fs / reference_rate_hz))) if reference_rate_hz > 0 else 0
@@ -6496,7 +6300,6 @@ class TaskEpochWorker(QThread):
             if lfp_task_metrics and not 0 < target_frequency < meta.fs / 2:
                 raise ValueError("任务目标频率必须介于 0 和奈奎斯特频率之间。")
             skipped = []
-            trial_quality = {}
             for number, tag in enumerate(requested, start=1):
                 candidates = self.markers[self.markers[:, 1] == int(tag)]
                 used_samples = []
@@ -6519,10 +6322,6 @@ class TaskEpochWorker(QThread):
                 processed_count = 0
                 accepted_trial_count = 0
                 usable_trials = np.zeros(columns.size, dtype=np.int64)
-                clean_window_counts = np.zeros(columns.size, dtype=np.int64)
-                available_window_counts = np.zeros(columns.size, dtype=np.int64)
-                short_epoch_trials = np.zeros(columns.size, dtype=np.int64)
-                response_only_trials = np.zeros(columns.size, dtype=np.int64)
                 spectral_sample_counts = np.zeros(columns.size, dtype=np.int64)
                 spectral_segment_counts = np.zeros(columns.size, dtype=np.int64)
                 target_power_sum = np.zeros(columns.size, dtype=np.float64)
@@ -6542,10 +6341,6 @@ class TaskEpochWorker(QThread):
                     length: np.zeros(columns.size, dtype=np.int64)
                     for length in external_baseline_by_length
                 }
-                quality_reasons = {
-                    name: np.zeros(columns.size, dtype=np.int64)
-                    for name in ("unavailable", "saturated", "flat", "jump")
-                }
                 external_time_task_trials = []
                 for marker_number, marker in enumerate(candidates[:limit or None], start=1):
                     center = int(marker[0]) - marker_offset
@@ -6558,127 +6353,74 @@ class TaskEpochWorker(QThread):
                         spectral_epoch = epoch
                         if np.any(base_mask):
                             epoch = epoch - np.nanmean(epoch[base_mask], axis=0, keepdims=True)
+                        usable = np.ones(columns.size, dtype=bool)
                         if lfp_task_metrics:
-                            quality_key = (int(tag), int(marker[0]))
-                            saved_quality = precomputed_trial_quality.get(quality_key)
-                            if saved_quality is None:
-                                clean_windows, quality = evaluate_task_trial_window_quality(
-                                    epoch, meta.fs, self.settings["epoch_start"], **quality_settings,
-                                )
-                            else:
-                                clean_windows = np.asarray(saved_quality["clean_windows"], dtype=bool)
-                                quality = {
-                                    name: np.asarray(saved_quality[name], dtype=bool)
-                                    for name in (*quality_reasons, "available")
-                                }
-                            if quality_only:
-                                trial_quality[quality_key] = {
-                                    "clean_windows": clean_windows,
-                                    **quality,
-                                }
-                            available_windows = np.sum(quality["available"], axis=0)
-                            # The full protocol requires three clean windows.
-                            # For a deliberately short epoch, apply the same
-                            # standard to the windows that actually exist:
-                            # two complete clean windows can support a 2 s
-                            # PSD, while absent W3-W5 remain unavailable.
-                            required_clean_windows = np.minimum(3, available_windows)
-                            quality_usable = (available_windows > 0) & (
-                                np.sum(clean_windows, axis=0) >= required_clean_windows
+                            target_power, local_noise_power, psd_samples, psd_segments = compute_task_continuous_psd_metrics(
+                                spectral_epoch, meta.fs,
+                                self.settings["epoch_start"], target_frequency,
+                                local_neighbor_bins,
                             )
-                            # Very short epochs can still contain the
-                            # configured baseline and response ranges even
-                            # though no full one-second QC window exists.
-                            # Keep those waveforms for response comparison;
-                            # their PSD fields remain empty because no
-                            # continuous two-second segment is available.
-                            response_samples = base_mask | response_mask
-                            response_usable = (
-                                np.mean(np.isfinite(epoch[response_samples]), axis=0) >= .995
-                                if np.any(response_samples) else np.ones(columns.size, dtype=bool)
-                            )
-                            usable = np.where(available_windows > 0, quality_usable, response_usable)
-                            if not quality_only:
-                                target_power, local_noise_power, psd_samples, psd_segments = compute_task_continuous_psd_metrics(
-                                    spectral_epoch, clean_windows, usable, meta.fs,
-                                    self.settings["epoch_start"], target_frequency,
-                                    local_neighbor_bins,
+                            valid_psd = psd_samples > 0
+                            target_power_sum += np.where(valid_psd, target_power * psd_samples, 0.0)
+                            local_noise_power_sum += np.where(valid_psd, local_noise_power * psd_samples, 0.0)
+                            spectral_sample_counts += psd_samples
+                            spectral_segment_counts += psd_segments
+                            if external_baseline_by_length:
+                                run_metrics = compute_task_psd_metrics_by_run_length(
+                                    spectral_epoch, meta.fs,
+                                    self.settings["epoch_start"], target_frequency, local_neighbor_bins,
+                                    tuple(external_baseline_by_length),
                                 )
-                                valid_psd = psd_samples > 0
-                                target_power_sum += np.where(valid_psd, target_power * psd_samples, 0.0)
-                                local_noise_power_sum += np.where(valid_psd, local_noise_power * psd_samples, 0.0)
-                                spectral_sample_counts += psd_samples
-                                spectral_segment_counts += psd_segments
-                                if external_baseline_by_length:
-                                    run_metrics = compute_task_psd_metrics_by_run_length(
-                                        spectral_epoch, clean_windows, usable, meta.fs,
-                                        self.settings["epoch_start"], target_frequency, local_neighbor_bins,
-                                        tuple(external_baseline_by_length),
+                                for length, (run_target, run_noise, run_samples, run_segments) in run_metrics.items():
+                                    baseline_target, baseline_noise, _valid_count, eligible = external_baseline_by_length[length]
+                                    matched = (
+                                        (run_samples > 0) & eligible
+                                        & np.isfinite(run_target) & np.isfinite(run_noise)
+                                        & np.isfinite(baseline_target) & np.isfinite(baseline_noise)
                                     )
-                                    for length, (run_target, run_noise, run_samples, run_segments) in run_metrics.items():
-                                        baseline_target, baseline_noise, _valid_count, eligible = external_baseline_by_length[length]
-                                        matched = (
-                                            (run_samples > 0) & eligible
-                                            & np.isfinite(run_target) & np.isfinite(run_noise)
-                                            & np.isfinite(baseline_target) & np.isfinite(baseline_noise)
-                                        )
-                                        external_task_target_sum += np.where(matched, run_target * run_samples, 0.0)
-                                        external_task_noise_sum += np.where(matched, run_noise * run_samples, 0.0)
-                                        external_baseline_target_sum += np.where(matched, baseline_target * run_samples, 0.0)
-                                        external_baseline_noise_sum += np.where(matched, baseline_noise * run_samples, 0.0)
-                                        external_matched_samples += np.where(matched, run_samples, 0)
-                                        external_matched_segments += np.where(matched, run_segments, 0)
-                                        external_matched_samples_by_length[length] += np.where(matched, run_samples, 0)
-                                # The existing task baseline fields define a
-                                # continuous pre-stim interval.  One complete
-                                # target-frequency cycle is required for its PSD.
-                                minimum_baseline_samples = max(3, int(np.ceil(meta.fs / target_frequency)))
-                                if np.count_nonzero(base_mask) >= minimum_baseline_samples:
-                                    baseline_power, _ = _continuous_segment_psd_metrics(
-                                        spectral_epoch[base_mask], meta.fs, target_frequency, local_neighbor_bins,
-                                    )
-                                    valid_baseline = usable & np.isfinite(baseline_power)
-                                    baseline_power_sum += np.where(valid_baseline, baseline_power, 0.0)
-                                    baseline_power_counts += valid_baseline
-                                # Legacy event-locked LFP SNR is a time-domain
-                                # power ratio.  It is intentionally distinct
-                                # from local tag-SNR, whose denominator is
-                                # neighbouring-frequency PSD power.
-                                if np.any(base_mask) and np.any(response_mask):
-                                    event_baseline_power = np.nanmean(epoch[base_mask] ** 2, axis=0)
-                                    event_response_power = np.nanmean(epoch[response_mask] ** 2, axis=0)
-                                    event_valid = (
-                                        usable
-                                        & np.isfinite(event_baseline_power)
-                                        & np.isfinite(event_response_power)
-                                    )
-                                    event_baseline_power_sum += np.where(event_valid, event_baseline_power, 0.0)
-                                    event_response_power_sum += np.where(event_valid, event_response_power, 0.0)
-                                    event_power_counts += event_valid
-                                if external_time_reference is not None:
-                                    finite_task_baseline = np.mean(np.isfinite(spectral_epoch[base_mask]), axis=0) >= quality_settings["available_ratio"]
-                                    finite_task_response = np.mean(np.isfinite(spectral_epoch[external_time_response_mask]), axis=0) >= quality_settings["available_ratio"]
-                                    time_usable = usable & finite_task_baseline & finite_task_response & (external_time_channel_indices >= 0)
-                                    corrected_epoch = spectral_epoch - np.nanmean(
-                                        spectral_epoch[base_mask], axis=0, keepdims=True,
-                                    )
-                                    trace = corrected_epoch[external_time_task_indices].astype(np.float32, copy=False)
-                                    external_time_task_trials.append(np.where(time_usable[None, :], trace, np.nan))
-                        else:
-                            # Spike task epochs retain the original marker
-                            # response aggregation only.  LFP quality/PSD
-                            # criteria never apply to the Spike page.
-                            clean_windows = np.zeros((5, columns.size), dtype=bool)
-                            available_windows = np.full(columns.size, 5, dtype=np.int64)
-                            usable = np.ones(columns.size, dtype=bool)
-                            quality = {name: np.zeros((5, columns.size), dtype=bool) for name in quality_reasons}
+                                    external_task_target_sum += np.where(matched, run_target * run_samples, 0.0)
+                                    external_task_noise_sum += np.where(matched, run_noise * run_samples, 0.0)
+                                    external_baseline_target_sum += np.where(matched, baseline_target * run_samples, 0.0)
+                                    external_baseline_noise_sum += np.where(matched, baseline_noise * run_samples, 0.0)
+                                    external_matched_samples += np.where(matched, run_samples, 0)
+                                    external_matched_segments += np.where(matched, run_segments, 0)
+                                    external_matched_samples_by_length[length] += np.where(matched, run_samples, 0)
+                            # The existing task baseline fields define a
+                            # continuous pre-stim interval.  One complete
+                            # target-frequency cycle is required for its PSD.
+                            minimum_baseline_samples = max(3, int(np.ceil(meta.fs / target_frequency)))
+                            if np.count_nonzero(base_mask) >= minimum_baseline_samples:
+                                baseline_power, _ = _continuous_segment_psd_metrics(
+                                    spectral_epoch[base_mask], meta.fs, target_frequency, local_neighbor_bins,
+                                )
+                                valid_baseline = usable & np.isfinite(baseline_power)
+                                baseline_power_sum += np.where(valid_baseline, baseline_power, 0.0)
+                                baseline_power_counts += valid_baseline
+                            # Legacy event-locked LFP SNR is a time-domain
+                            # power ratio.  It is intentionally distinct
+                            # from local tag-SNR, whose denominator is
+                            # neighbouring-frequency PSD power.
+                            if np.any(base_mask) and np.any(response_mask):
+                                event_baseline_power = np.nanmean(epoch[base_mask] ** 2, axis=0)
+                                event_response_power = np.nanmean(epoch[response_mask] ** 2, axis=0)
+                                event_valid = (
+                                    usable
+                                    & np.isfinite(event_baseline_power)
+                                    & np.isfinite(event_response_power)
+                                )
+                                event_baseline_power_sum += np.where(event_valid, event_baseline_power, 0.0)
+                                event_response_power_sum += np.where(event_valid, event_response_power, 0.0)
+                                event_power_counts += event_valid
+                            if external_time_reference is not None:
+                                finite_task_baseline = np.all(np.isfinite(spectral_epoch[base_mask]), axis=0)
+                                finite_task_response = np.all(np.isfinite(spectral_epoch[external_time_response_mask]), axis=0)
+                                time_usable = usable & finite_task_baseline & finite_task_response & (external_time_channel_indices >= 0)
+                                corrected_epoch = spectral_epoch - np.nanmean(
+                                    spectral_epoch[base_mask], axis=0, keepdims=True,
+                                )
+                                trace = corrected_epoch[external_time_task_indices].astype(np.float32, copy=False)
+                                external_time_task_trials.append(np.where(time_usable[None, :], trace, np.nan))
                         usable_trials += usable
-                        clean_window_counts += np.sum(clean_windows, axis=0)
-                        available_window_counts += available_windows
-                        short_epoch_trials += available_windows < 5
-                        response_only_trials += (available_windows == 0) & usable
-                        for reason, counts in quality_reasons.items():
-                            counts += np.sum(quality[reason], axis=0)
                         accepted_trial_count += int(np.any(usable))
                         masked_epoch = np.where(usable[None, :], epoch, np.nan)
                         if streaming_mean:
@@ -6703,11 +6445,6 @@ class TaskEpochWorker(QThread):
                     skipped.append(
                         f"tag {int(tag)}：{len(candidates)} 个 marker 都不在当前数据段的完整 epoch 范围内 "
                         f"(数据全局样本范围 {marker_offset}–{marker_offset + meta.rows - 1})"
-                    )
-                    continue
-                if not np.any(usable_trials) and not quality_only:
-                    skipped.append(
-                        f"tag {int(tag)}：{processed_count} 个完整 trial 中，没有任何通道在 0.5-5.5 s 的五个窗口内通过至少 3 个干净窗口。"
                     )
                     continue
                 array = None if streaming_mean else np.stack(epochs)
@@ -6848,14 +6585,6 @@ class TaskEpochWorker(QThread):
                     "tag": int(tag), "trials": processed_count,
                     "usable_trials": int(usable_trials[channel]),
                     "rejected_trials": int(processed_count - usable_trials[channel]),
-                    "clean_windows": int(clean_window_counts[channel]),
-                    "available_windows": int(available_window_counts[channel]),
-                    "short_epoch_trials": int(short_epoch_trials[channel]),
-                    "response_only_trials": int(response_only_trials[channel]),
-                    "unavailable_windows": int(quality_reasons["unavailable"][channel]),
-                    "saturated_windows": int(quality_reasons["saturated"][channel]),
-                    "flat_windows": int(quality_reasons["flat"][channel]),
-                    "jump_windows": int(quality_reasons["jump"][channel]),
                     "spectral_samples": int(spectral_sample_counts[channel]),
                     "spectral_seconds": float(spectral_sample_counts[channel] / meta.fs),
                     "spectral_segments": int(spectral_segment_counts[channel]),
@@ -6986,7 +6715,21 @@ class TaskEpochWorker(QThread):
                         "end_sec": end_sec, "animal_count": len(valid_latencies),
                     })
                     self.progress.emit(88 + 12 * behavior_index / max(1, len(behavior_tags)), f"Letter 长行为窗：tag {tag}")
-            self.completed.emit({"results": result, "channel_ids": channel_ids, "columns": columns, "fs": float(meta.fs), "aggregate": self.settings["aggregate"], "view_mode": self.settings.get("view_mode", "raw"), "mode": self.settings.get("mode", "Flash"), "lfp_task_metrics": lfp_task_metrics, "quality_only": quality_only, "quality_signature": self.settings.get("quality_signature"), "trial_quality": trial_quality, "source_signature": (int(meta.rows), float(meta.fs), float(meta.time_offset), tuple(int(value) for value in meta.channel_ids)), "source_identity": (id(self.source), id(getattr(self.source, "data", None))), "epoch_start_ms": float(self.settings["epoch_start"]), "epoch_end_ms": float(self.settings["epoch_end"]), "baseline_start_ms": float(self.settings["baseline_start"]), "baseline_end_ms": float(self.settings["baseline_end"]), "task_processing": {name: self.settings.get(name) for name in ("analysis_notch", "analysis_bandpass", "analysis_band_low", "analysis_band_high", "smooth", "smooth_window_sec", "zscore")}, "behavior_result": behavior_results[0] if behavior_results else None, "behavior_results": behavior_results})
+            self.completed.emit({
+                "results": result, "channel_ids": channel_ids, "columns": columns, "fs": float(meta.fs),
+                "aggregate": self.settings["aggregate"], "view_mode": self.settings.get("view_mode", "raw"),
+                "mode": self.settings.get("mode", "Flash"), "lfp_task_metrics": lfp_task_metrics,
+                "task_signature": self.settings.get("task_signature"),
+                "source_signature": (int(meta.rows), float(meta.fs), float(meta.time_offset), tuple(int(value) for value in meta.channel_ids)),
+                "source_identity": (id(self.source), id(getattr(self.source, "data", None))),
+                "epoch_start_ms": float(self.settings["epoch_start"]), "epoch_end_ms": float(self.settings["epoch_end"]),
+                "baseline_start_ms": float(self.settings["baseline_start"]), "baseline_end_ms": float(self.settings["baseline_end"]),
+                "task_processing": {name: self.settings.get(name) for name in (
+                    "analysis_notch", "analysis_bandpass", "analysis_band_low", "analysis_band_high",
+                    "smooth", "smooth_window_sec", "zscore",
+                )},
+                "behavior_result": behavior_results[0] if behavior_results else None, "behavior_results": behavior_results,
+            })
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -7081,7 +6824,7 @@ class TrialVepWorker(QThread):
 
 
 class ExternalTimeFrequencyWorker(QThread):
-    """Compute one QC-matched task/rest power time-frequency comparison."""
+    """Compute one task/rest power time-frequency comparison."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -7143,28 +6886,6 @@ class ExternalTimeFrequencyWorker(QThread):
             response_mask = (t_ms >= response_start) & (t_ms <= response_end)
             if not np.any(baseline_mask) or not np.any(response_mask):
                 raise ValueError("时频基线窗或对比窗没有采样点。")
-            quality_settings = dict(self.settings["quality_settings"])
-            quality_kwargs = {
-                "flat_epsilon": float(quality_settings["quality_flat_epsilon"]),
-                "flat_ratio_percent": float(quality_settings["quality_flat_ratio_percent"]),
-                "flat_ptp": float(quality_settings["quality_flat_ptp"]),
-                "available_ratio": float(quality_settings["quality_available_ratio"]),
-                "saturation_run_samples": int(quality_settings["quality_saturation_run_samples"]),
-                "jump_mad_multiplier": float(quality_settings["quality_jump_mad_multiplier"]),
-                "jump_median_multiplier": float(quality_settings["quality_jump_median_multiplier"]),
-                "jump_flat_floor_multiplier": float(quality_settings["quality_jump_flat_floor_multiplier"]),
-            }
-
-            def valid_epoch(epoch: np.ndarray) -> bool:
-                clean, quality = evaluate_task_trial_window_quality(epoch[:, None], fs, epoch_start, **quality_kwargs)
-                available = int(np.sum(quality["available"][:, 0]))
-                usable = available > 0 and int(np.sum(clean[:, 0])) >= min(3, available)
-                finite = (
-                    np.mean(np.isfinite(epoch[baseline_mask])) >= quality_kwargs["available_ratio"]
-                    and np.mean(np.isfinite(epoch[response_mask])) >= quality_kwargs["available_ratio"]
-                )
-                return bool(usable and finite)
-
             self.progress.emit(3, "时频图：读取并应用任务分析预处理…")
             task_values = conditioned(self.task_source, task_lookup[self.channel_id])
             baseline_values = conditioned(self.baseline_source, baseline_lookup[self.channel_id])
@@ -7178,7 +6899,7 @@ class ExternalTimeFrequencyWorker(QThread):
                 if first < 0 or last > task_values.size:
                     continue
                 epoch = task_values[first:last]
-                if valid_epoch(epoch):
+                if np.all(np.isfinite(epoch[baseline_mask | response_mask])):
                     task_epochs.append(epoch)
                 if index % 4 == 0:
                     self.progress.emit(5 + 35 * index / max(1, len(samples)), f"时频图：任务 trial {index}/{len(samples)}")
@@ -7186,7 +6907,7 @@ class ExternalTimeFrequencyWorker(QThread):
             starts = np.asarray((self.reference.get("time_reference") or {}).get("candidate_starts", []), dtype=np.int64)
             for index, first in enumerate(starts, start=1):
                 epoch = baseline_values[int(first):int(first) + epoch_samples]
-                if epoch.size == epoch_samples and valid_epoch(epoch):
+                if epoch.size == epoch_samples and np.all(np.isfinite(epoch[baseline_mask | response_mask])):
                     rest_epochs.append(epoch)
                 self.progress.emit(40 + 25 * index / max(1, starts.size), f"时频图：静息伪 epoch {index}/{starts.size}")
             if len(task_epochs) < 3 or len(rest_epochs) < 3:
@@ -7242,15 +6963,15 @@ class ExternalTimeFrequencyWorker(QThread):
 
 
 class ItpcWorker(QThread):
-    """Stream marker-aligned Morlet phases using the saved page-4 QC mask."""
+    """Stream marker-aligned Morlet phases directly from complete epochs."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, source, quality_output: dict, settings: dict):
+    def __init__(self, source, task_context: dict, settings: dict):
         super().__init__()
         self.source = source
-        self.quality_output = quality_output
+        self.task_context = task_context
         self.settings = settings
 
     def run(self) -> None:
@@ -7258,11 +6979,11 @@ class ItpcWorker(QThread):
             from scipy import signal
 
             meta = self.source.metadata
-            columns = np.asarray(self.quality_output["columns"], dtype=np.int64)
-            channel_ids = np.asarray(self.quality_output["channel_ids"], dtype=int)
-            cached = self.quality_output["trial_quality"]
-            epoch_start = float(self.quality_output["epoch_start_ms"])
-            epoch_end = float(self.quality_output["epoch_end_ms"])
+            columns = np.asarray(self.task_context["columns"], dtype=np.int64)
+            channel_ids = np.asarray(self.task_context["channel_ids"], dtype=int)
+            markers = np.asarray(self.task_context["markers"], dtype=np.int64)
+            epoch_start = float(self.task_context["epoch_start_ms"])
+            epoch_end = float(self.task_context["epoch_end_ms"])
             frequencies = np.arange(self.settings["freq_low"], self.settings["freq_high"] + self.settings["freq_step"] * .25, self.settings["freq_step"])
             if not frequencies.size or frequencies[-1] >= meta.fs / 2:
                 raise ValueError("ITPC 频率必须位于 0 和奈奎斯特频率之间。")
@@ -7279,7 +7000,7 @@ class ItpcWorker(QThread):
                 raise ValueError("ITPC 时间范围不在当前 epoch 内。")
             t_ms = t_ms[wanted_time]
             marker_offset = int(round(float(meta.time_offset) * meta.fs))
-            processing = dict(self.quality_output.get("task_processing") or {})
+            processing = dict(self.task_context.get("task_processing") or {})
             data = None
             if any((processing.get("analysis_notch"), processing.get("analysis_bandpass"), processing.get("smooth"), processing.get("zscore"))):
                 raw, _ = self.source.materialize() if not hasattr(self.source, "data") else (self.source.data, None)
@@ -7295,12 +7016,18 @@ class ItpcWorker(QThread):
                     deviation = np.nanstd(data, axis=0, keepdims=True); deviation[deviation == 0] = 1.0
                     data = (data - np.nanmean(data, axis=0, keepdims=True)) / deviation
             by_tag: dict[int, list[int]] = {}
-            for tag, sample in cached:
+            for sample, tag in markers:
                 by_tag.setdefault(int(tag), []).append(int(sample))
+            limit = max(0, int(self.task_context.get("trial_limit", 0)))
+            by_tag = {
+                tag: [sample for sample in samples[:limit or None]
+                      if sample - marker_offset + first >= 0 and sample - marker_offset + last <= meta.rows]
+                for tag, samples in by_tag.items()
+            }
             requested_tags = set(self.settings.get("tags") or by_tag)
-            tags = [tag for tag in sorted(by_tag) if tag in requested_tags]
+            tags = [tag for tag in sorted(by_tag) if tag in requested_tags and by_tag[tag]]
             if not tags:
-                raise ValueError("所选 ITPC tag 不在已缓存的五窗质量结果中。")
+                raise ValueError("所选 ITPC tag 没有落在当前数据范围内的完整 epoch。")
             max_cells = len(tags) * frequencies.size * t_ms.size * max(1, columns.size)
             if max_cells > 30_000_000:
                 raise ValueError("ITPC 输出过大；请缩小 tag、通道、频率或时间范围。")
@@ -7319,23 +7046,21 @@ class ItpcWorker(QThread):
                         epoch = signal.resample_poly(epoch, ratio.numerator, ratio.denominator, axis=0).astype(np.float32, copy=False)
                     if epoch.shape[0] != output_samples:
                         epoch = epoch[:output_samples]
-                    clean = np.asarray(cached[(tag, sample)]["clean_windows"], dtype=bool)
                     for freq_index, frequency in enumerate(frequencies):
                         support_ms = self.settings["cycles"] / (2.0 * frequency) * 1000.0
                         half_width = max(2, int(np.ceil(support_ms / 1000.0 * work_fs)))
                         wave_t = np.arange(-half_width, half_width + 1, dtype=float) / work_fs
                         wavelet = np.exp(2j * np.pi * frequency * wave_t) * np.exp(-wave_t ** 2 / (2.0 * (self.settings["cycles"] / (2.0 * np.pi * frequency)) ** 2))
                         coefficients = signal.fftconvolve(epoch, wavelet[:, None], mode="same", axes=0)
-                        for window in range(5):
-                            left_ms, right_ms = 500.0 + 1000.0 * window, 1500.0 + 1000.0 * window
-                            valid_time = (t_ms >= left_ms + support_ms) & (t_ms < right_ms - support_ms)
-                            valid_channels = np.flatnonzero(clean[window])
-                            if valid_channels.size and np.any(valid_time):
-                                original_positions = np.flatnonzero(wanted_time)[valid_time]
-                                values = coefficients[original_positions[:, None], valid_channels[None, :]]
-                                target = np.ix_(np.flatnonzero(valid_time), valid_channels)
-                                phase_sum[freq_index][target] += values / np.maximum(np.abs(values), np.finfo(np.float32).tiny)
-                                counts[freq_index][target] += 1
+                        # Only the natural epoch edges limit wavelet support;
+                        # there are no artificial one-second QC boundaries.
+                        valid_time = (t_ms >= epoch_start + support_ms) & (t_ms < epoch_end - support_ms)
+                        positions = np.flatnonzero(wanted_time)[valid_time]
+                        values = coefficients[positions]
+                        finite = np.isfinite(values)
+                        unit_phase = values / np.maximum(np.abs(values), np.finfo(np.float32).tiny)
+                        phase_sum[freq_index, valid_time] += np.where(finite, unit_phase, 0.0)
+                        counts[freq_index, valid_time] += finite
                         done += 1
                         self.progress.emit(100.0 * done / max(1, total), f"ITPC：tag {tag}，trial {sample}，{frequency:g} Hz")
                 itpc = np.abs(phase_sum) / np.maximum(counts, 1)
@@ -7649,6 +7374,216 @@ class QtAnalysisGUI(QMainWindow):
         box.setVisible(position > 0)
         self._make_collapsible(box, collapsed=True)
         return box
+
+    def _lfp_parameter_editor(self, name: str, scope: str) -> QWidget | None:
+        """Reuse a free controller, or mirror it without stealing another page's widget.
+
+        Calculations and parameter CSVs continue to read the original controller.
+        Shared frequency/baseline fields are editable beside each affected metric;
+        all copies, including the alignment-page controls, stay synchronized.
+        """
+        source = getattr(self, name, None)
+        if not isinstance(source, QWidget):
+            return None
+        if source.parent() is None:
+            editor = source
+        else:
+            if isinstance(source, QLineEdit):
+                editor = QLineEdit(source.text())
+                editor.setPlaceholderText(source.placeholderText())
+                source.textChanged.connect(editor.setText)
+                editor.textChanged.connect(source.setText)
+            elif isinstance(source, QCheckBox):
+                editor = QCheckBox()
+                editor.setChecked(source.isChecked())
+                source.toggled.connect(editor.setChecked)
+                editor.toggled.connect(source.setChecked)
+            elif isinstance(source, QComboBox):
+                editor = QComboBox()
+                for index in range(source.count()):
+                    editor.addItem(source.itemText(index), source.itemData(index))
+                editor.setCurrentIndex(source.currentIndex())
+                source.currentIndexChanged.connect(editor.setCurrentIndex)
+                editor.currentIndexChanged.connect(source.setCurrentIndex)
+            else:
+                raise TypeError(f"Unsupported shared LFP parameter: {name}")
+            editor.setObjectName(f"lfp_{scope}_{name}")
+        editor.setMinimumWidth(68)
+        editor.setMaximumWidth(145)
+        self.lfp_metric_parameter_editors.setdefault(name, []).append(editor)
+        return editor
+
+    def _build_lfp_parameter_panel(self, band_holder: QWidget) -> QGroupBox:
+        """Group task metric inputs by their actual computational dependencies."""
+        panel = QGroupBox("第 2 步：设置分析参数（按计算指标分组）")
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(8, 8, 8, 7)
+        outer.setSpacing(5)
+        self.lfp_metric_parameter_editors = {}
+        self.lfp_metric_parameter_groups = {}
+
+        def note(text: str) -> QLabel:
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setStyleSheet("color:#24516e; padding:2px 0;")
+            return label
+
+        def section(key: str, title: str, explanation: str, fields: list[tuple[str, str, str]], columns: int = 3) -> QGroupBox:
+            box = QGroupBox(title)
+            body = QVBoxLayout(box)
+            body.setContentsMargins(7, 7, 7, 6)
+            body.setSpacing(4)
+            body.addWidget(note(explanation))
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(4)
+            position = 0
+            for name, label_text, help_text in fields:
+                editor = self._lfp_parameter_editor(name, key)
+                if editor is None:
+                    continue
+                cell = QWidget()
+                row = QHBoxLayout(cell)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(5)
+                label = QLabel(label_text)
+                label.setToolTip(help_text)
+                editor.setToolTip(help_text)
+                row.addWidget(label)
+                row.addWidget(editor)
+                row.addStretch(1)
+                grid.addWidget(cell, position // columns, position % columns)
+                position += 1
+            body.addLayout(grid)
+            self.lfp_metric_parameter_groups[key] = box
+            outer.addWidget(box)
+            return box
+
+        outer.addWidget(note(
+            "以下三个指标由“Letter 任务分析”计算，按通道、Tag 分别汇总，单位均为 dB。"
+            "目标频率 → 前两个指标；邻频 bin → 仅 local_tag_snr_db；基线窗 → 后两个指标；响应窗 → 仅 event_lfp_snr_db。"
+            "重复显示的参数是同一设置，与时间对齐页同步；所有时间窗均相对刺激起点。"
+        ))
+        section("shared", "共同取数：影响三个指标",
+                "Epoch 决定每次读取范围；Tag、刺激类型数和 Trial 限制决定纳入哪些刺激。"
+                "Letter 实际取数上限为每 Tag Trial、对比 A、对比 B 三者的最大值；三者均为 0 才取全部。", [
+            ("epoch_start_ms_var", "Epoch 起点 ms", "三个指标共用；应覆盖基线、响应及 500–5500 ms 稳态区间。"),
+            ("epoch_end_ms_var", "Epoch 终点 ms", "三个指标共用；超出数据边界的完整 epoch 不会纳入。"),
+            ("stimtag_var", "刺激 Tag", "逗号分隔；留空取可用 Tag。"),
+            ("n_stim_types_var", "最多 Tag 数", "0 表示全部；正数限制所选 Tag 数。"),
+            ("trials_per_stim_var", "每 Tag Trial 上限", "Letter 取该值与对比 A/B 的最大值；均为 0 时取全部。"),
+            ("compare_trial_a_var", "对比 Trial A", "影响波形对比，也可能提高 Letter 实际纳入的 Trial 数。"),
+            ("compare_trial_b_var", "对比 Trial B", "影响波形对比，也可能提高 Letter 实际纳入的 Trial 数。"),
+        ])
+        section("local_tag_snr_db", "local_tag_snr_db｜目标频率相对邻频的突出度",
+                "10·log₁₀（刺激后目标频率 PSD ÷ 邻频平均 PSD）。只取刺激后 0.5–5.5 s 的连续数据（至少 2 s）；"
+                "不做五窗筛选，跨 Trial 按有效时长加权。值越高，目标频率越突出，不代表整体时域噪声越小。", [
+            ("task_target_freq_var", "目标频率 Hz（共用）", "影响 local_tag_snr_db 和 target_power_change_db；每个连续片段取最接近目标频率的 PSD bin。"),
+            ("neighbor_bins_var", "每侧邻频 bin 数", "只影响 local_tag_snr_db：目标 bin 左右各取 N 个，排除目标自身，边界处取现有 bin；bin 间隔随片段长度变化。"),
+        ], columns=2)
+        change_box = section("target_power_change_db", "target_power_change_db｜目标频率相对刺激前的功率变化",
+                "10·log₁₀（刺激后目标频率 PSD ÷ 刺激前同频 PSD）。分子与 local_tag_snr_db 相同；"
+                "分母来自每次刺激前基线窗，跨可用 Trial 等权平均，不是另外导入的静息 baseline H5。"
+                "正值表示该频率增强；邻频 bin 和响应窗不影响这个比值。", [
+            ("task_target_freq_var", "目标频率 Hz（共用）", "与上方同一设置；刺激前基线至少需要一个目标频率周期的采样点。"),
+            ("baseline_start_ms_var", "基线起点 ms（共用）", "影响 target_power_change_db 的分母，以及 event_lfp_snr_db 的基线校正和分母。"),
+            ("baseline_end_ms_var", "基线终点 ms（共用）", "与事件功率比共用；基线过短时同频 PSD 无法计算，结果为 NaN/空值。"),
+        ])
+        self.lfp_metric_baseline_warning = note("")
+        change_box.layout().addWidget(self.lfp_metric_baseline_warning)
+        section("event_lfp_snr_db", "event_lfp_snr_db｜响应窗 / 刺激前基线的时域功率比",
+                "10·log₁₀（响应窗均方幅值 ÷ 基线窗均方幅值）。每个 Trial 先减去自身基线均值，"
+                "分别求两个窗口的均方幅值，再跨可用 Trial 等权平均后求比值；不是先平均波形再求 SNR。"
+                "反映响应期总能量变化，也会包含自发活动和伪迹，不是纯诱发信号 / 噪声比；目标频率、邻频 bin 均不影响。", [
+            ("baseline_start_ms_var", "基线起点 ms（共用）", "与上方功率变化共用；用于每 Trial 去基线均值和时域分母。"),
+            ("baseline_end_ms_var", "基线终点 ms（共用）", "与上方同一设置；时间范围按采样点包含起止边界。"),
+            ("response_start_ms_var", "响应起点 ms", "三个指标中只影响 event_lfp_snr_db；也用于响应峰值及波形显示。"),
+            ("response_end_ms_var", "响应终点 ms", "三个指标中只影响 event_lfp_snr_db；不会改变前两个指标固定的 0.5–5.5 s 稳态取数范围。"),
+        ], columns=2)
+        section("processing", "共同分析处理：影响三个指标（不改写预处理数据）",
+                "这组选项在取 Epoch 前作用于分析数据副本，改变三个指标的输入。"
+                "开启陷波、带通、平滑或 Z-score 时会读取完整记录；不需要额外处理时保持关闭。", [
+            ("analysis_notch_var", "分析 50 Hz 陷波", "分析副本处理，不等同于预处理页的滤波开关；会影响三个指标。"),
+            ("analysis_bandpass_var", "分析带通", "开启后使用下方上下限；会影响三个指标。"),
+            ("analysis_band_low_var", "带通下限 Hz", "仅在启用分析带通时生效；三个指标共用。"),
+            ("analysis_band_high_var", "带通上限 Hz", "仅在启用分析带通时生效；三个指标共用。"),
+            ("smooth_signal_var", "分析平滑", "与时间对齐页同一设置；开启后影响三个指标。"),
+            ("smooth_window_size_var", "平滑窗 s", "仅启用分析平滑时生效。"),
+            ("zscoredata_var", "分析 Z-score", "逐记录归一化；影响分析输入，不是只调整显示。"),
+        ])
+        display_box = self._legacy_parameter_panel("PSD 查看 / 波形显示参数（不直接控制上述三个比值）", [
+            "psd_channel_source_var", "psd_page_size_var", "psd_welch_sec_var", "psd_overlap_var",
+            "psd_freq_low_var", "psd_freq_high_var", "psd_scale_var", "psd_mark_stim_var",
+            "psd_stim_freq_var", "psd_stim_harmonics_var", "psd_mask_stim_var", "psd_bandwidth_var",
+            "analysis_view_mode_var", "resting_page_size_var", "auto_plot_marker_alignment_var",
+        ])
+        display_box.layout().addWidget(note(
+            "Welch 窗、重叠、PSD 上下限、刺激频率标记/屏蔽只用于 PSD 查看；任务频域指标使用连续稳态数据自身长度，"
+            "Hann 窗、无重叠。下方 Mean/Median 只改变聚合波形，不改变三个功率比的平均规则。"
+        ), 10, 0, 1, 5)
+        display_fields = section("wave_display", "任务波形显示（不改变三个功率比）", "这些参数只用于任务波形与分页显示。", [
+            ("task_response_aggregate_var", "波形聚合 Mean/Median", "只改变显示的聚合波形，三个指标仍按各自功率平均规则计算。"),
+            ("tvep_page_size_var", "任务每页通道数", "只影响任务分页显示。"),
+        ], columns=2)
+        outer.removeWidget(display_fields)
+        display_box.layout().addWidget(display_fields, 11, 0, 1, 5)
+        outer.addWidget(display_box)
+        display_toggle = QPushButton("展开 / 收起 PSD 与波形显示参数")
+        display_toggle.clicked.connect(lambda: self._toggle_parameter_section(display_box))
+        outer.addWidget(display_toggle)
+
+        legacy_box = self._legacy_parameter_panel("其他旧版分析参数（不控制上述三个任务指标）", [
+            "snr_mode_var", "snr_skip_var", "stim_interval_var", "stim_duration_var", "first_onset_var",
+            "stim_freq_var", "harmonics_var", "fft_len_var", "state_start_var", "state_duration_var", "trial_count_var",
+        ])
+        legacy_box.layout().addWidget(note(
+            "此处信号/噪声频段及旧版 FFT、刺激/状态参数不参与上述三个指标。"
+            "“运行静息态多频段 SNR”使用页面说明中的固定六频段，不使用此处自定义信号/噪声频段。"
+        ), 10, 0, 1, 5)
+        legacy_box.layout().addWidget(band_holder, 11, 0, 1, 5)
+        outer.addWidget(legacy_box)
+        legacy_toggle = QPushButton("展开 / 收起其他旧版参数")
+        legacy_toggle.clicked.connect(lambda: self._toggle_parameter_section(legacy_box))
+        outer.addWidget(legacy_toggle)
+        # Recompute folding after adding the explanatory labels and subgroups.
+        self._make_collapsible(display_box, collapsed=True)
+        self._make_collapsible(legacy_box, collapsed=True)
+        for name in ("task_target_freq_var", "baseline_start_ms_var", "baseline_end_ms_var", "epoch_start_ms_var", "epoch_end_ms_var"):
+            widget = getattr(self, name, None)
+            if isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._update_lfp_metric_baseline_warning)
+        self._update_lfp_metric_baseline_warning()
+        self._make_collapsible(panel, collapsed=True)
+        return panel
+
+    def _update_lfp_metric_baseline_warning(self, *_args) -> None:
+        """Explain a missing spectral baseline without altering calculation or defaults."""
+        label = self.lfp_metric_baseline_warning
+        try:
+            value = lambda name: float(self._widget_text(getattr(self, name)))
+            frequency = value("task_target_freq_var")
+            first, last = value("baseline_start_ms_var"), value("baseline_end_ms_var")
+            epoch_first, epoch_last = value("epoch_start_ms_var"), value("epoch_end_ms_var")
+            if not all(np.isfinite(item) for item in (frequency, first, last, epoch_first, epoch_last)) or frequency <= 0 or last <= first:
+                raise ValueError("invalid baseline")
+            actual_ms = max(0.0, min(last, epoch_last) - max(first, epoch_first))
+            minimum_ms = 1000.0 / frequency
+            if actual_ms < minimum_ms:
+                label.setText(
+                    f"注意：目标 {frequency:g} Hz 的刺激前 PSD 至少需要约 {minimum_ms:g} ms（一个周期）；"
+                    f"当前 Epoch 内基线跨度仅 {actual_ms:g} ms，target_power_change_db 可能为 NaN/空值。"
+                    "这不代表 local_tag_snr_db 或事件功率比也无法计算；最终按实际采样点数判断。"
+                )
+                label.setStyleSheet("color:#b45309; padding:2px 0;")
+            else:
+                label.setText(
+                    f"当前 Epoch 内基线跨度 {actual_ms:g} ms，目标 {frequency:g} Hz 的一个周期约 {minimum_ms:g} ms。"
+                    "已满足周期长度提示；仍需有效采样点及可用 Trial。该基线窗也同步影响 event_lfp_snr_db。"
+                )
+                label.setStyleSheet("color:#24516e; padding:2px 0;")
+        except (ValueError, TypeError):
+            label.setText("请填写有效的目标频率及基线/Epoch 时间范围；此处只提示，不改变实际计算。")
+            label.setStyleSheet("color:#b45309; padding:2px 0;")
 
     @staticmethod
     def _make_collapsible(box: QGroupBox, collapsed: bool = True) -> None:
@@ -8116,7 +8051,7 @@ class QtAnalysisGUI(QMainWindow):
         remap_only = QPushButton("执行通道重映射")
         remap_only.clicked.connect(lambda: self.run_preprocess(force_filter_off=True))
         full_h5 = QPushButton("导入完整 H5 做预处理")
-        full_h5.clicked.connect(self.choose_full_h5)
+        full_h5.clicked.connect(self.choose_file)
         overview = QPushButton("选择滤波通道（总览）")
         overview.clicked.connect(self.open_preprocess_filter_overview)
         show_preprocess_params = QPushButton("显示参数")
@@ -8766,11 +8701,6 @@ class QtAnalysisGUI(QMainWindow):
         next_step.clicked.connect(lambda: self._activate_page(4))
         apply_parameters = QPushButton("应用参数并运行多频段 SNR"); apply_parameters.clicked.connect(self.run_resting_multiband_snr)
         batch_parameters = QPushButton("参数 CSV 批量处理"); batch_parameters.clicked.connect(lambda: self.run_parameter_csv_batch(False))
-        task_quality = QPushButton("执行 trial 五窗质量判断")
-        task_quality.setObjectName("primaryAction")
-        task_quality.clicked.connect(self.run_lfp_trial_quality_check)
-        task_browser = QPushButton("查看 trial 五窗波形")
-        task_browser.clicked.connect(self.show_lfp_trial_quality_browser)
         task_letter = QPushButton("Letter 任务分析")
         task_letter.setObjectName("primaryAction")
         task_letter.clicked.connect(self.run_lfp_letter_frequency_analysis)
@@ -8780,8 +8710,6 @@ class QtAnalysisGUI(QMainWindow):
         export_vep.clicked.connect(self.export_trial_vep)
         self.lfp_trial_vep_button = task_vep
         self.lfp_trial_vep_export_button = export_vep
-        self.lfp_trial_quality_button = task_quality
-        self.lfp_trial_quality_browser_button = task_browser
         self.lfp_letter_task_button = task_letter
         source_row = QHBoxLayout()
         source_row.setContentsMargins(0, 0, 0, 0)
@@ -8808,19 +8736,21 @@ class QtAnalysisGUI(QMainWindow):
         channel_select_row.addStretch(1)
         task_workflow = QGroupBox("任务分析主流程")
         task_workflow_layout = QVBoxLayout(task_workflow)
-        task_hint = QLabel("依赖顺序：时间对齐完成 → trial 五窗 QC → Letter 任务分析。后续 VEP、ITPC 和 baseline 比较均属于扩展分析。")
+        task_hint = QLabel("依赖顺序：时间对齐完成 → Letter 任务分析（直接使用完整 Epoch，无五窗筛选）。后续 VEP、ITPC 和 baseline 比较均属于扩展分析。")
         task_hint.setWordWrap(True)
         task_hint.setStyleSheet("color:#24516e; padding:2px 0;")
-        task_qc_row = QHBoxLayout()
-        task_qc_row.addWidget(QLabel("① 质量判断")); task_qc_row.addWidget(task_quality); task_qc_row.addWidget(task_browser); task_qc_row.addStretch(1)
         task_analysis_row = QHBoxLayout()
-        task_analysis_row.addWidget(QLabel("② 核心分析")); task_analysis_row.addWidget(task_letter); task_analysis_row.addStretch(1)
+        task_analysis_row.addWidget(QLabel("① 核心分析")); task_analysis_row.addWidget(task_letter); task_analysis_row.addStretch(1)
         task_extension_row = QHBoxLayout()
-        task_extension_row.addWidget(QLabel("③ 扩展分析")); task_extension_row.addWidget(task_vep); task_extension_row.addWidget(export_vep); task_extension_row.addStretch(1)
+        task_extension_row.addWidget(QLabel("② 扩展分析")); task_extension_row.addWidget(task_vep); task_extension_row.addWidget(export_vep); task_extension_row.addStretch(1)
         task_workflow_layout.addWidget(task_hint)
-        task_workflow_layout.addLayout(task_qc_row)
         task_workflow_layout.addLayout(task_analysis_row)
         task_workflow_layout.addLayout(task_extension_row)
+        animal_test = QPushButton("测试：AnimalStart 峰谷对齐平均")
+        animal_test.setToolTip("独立测试：每个有效 trial 找最大值、最小值，两套平均；可调搜索/截取长度并导出逐 trial 详情。")
+        animal_test.clicked.connect(self.open_animal_peak_test)
+        self.lfp_animal_peak_test_button = animal_test
+        task_workflow_layout.addWidget(animal_test)
 
         source_row.insertWidget(max(0, source_row.count() - 1), params)
         source_row.insertWidget(max(0, source_row.count() - 1), batch_parameters)
@@ -8834,7 +8764,7 @@ class QtAnalysisGUI(QMainWindow):
 
         actions_layout.insertLayout(0, source_row)
         actions_layout.insertLayout(1, channel_select_row)
-        external_baseline = QGroupBox("实验前静息 baseline（按任务连续五窗长度配对）")
+        external_baseline = QGroupBox("实验前静息 baseline（按任务连续片段长度配对）")
         external_baseline_layout = QGridLayout(external_baseline)
         self.external_baseline_file_label = QLabel("尚未导入实验前 baseline H5。")
         self.external_baseline_file_label.setWordWrap(True)
@@ -8907,15 +8837,15 @@ class QtAnalysisGUI(QMainWindow):
         external_baseline_layout.addWidget(self.external_tf_cycles_spin, 4, 7)
         external_baseline_layout.addWidget(external_tf, 5, 0, 1, 3)
         external_baseline_layout.addWidget(
-            QLabel("每种长度从整段记录的不同分层随机位置抽取连续片段；只与任务中连续 3、4、5 个干净窗分别配对。"),
+            QLabel("每种长度从整段记录的不同分层随机位置抽取连续片段；只与任务中相同长度的连续片段配对，不做五窗筛选。"),
             5, 3, 1, 5,
         )
-        self.external_baseline_qc_summary = QLabel("准备 baseline 参考后，将显示每个通道和长度的 QC 拒绝原因。")
+        self.external_baseline_qc_summary = QLabel("准备 baseline 参考后，显示每个通道和长度的可计算片段数（不做五窗筛选）。")
         self.external_baseline_qc_summary.setWordWrap(True)
         self.external_baseline_qc_summary.setStyleSheet("color:#24516e; padding:2px 0;")
-        self.external_baseline_qc_table = QTableWidget(0, 10)
+        self.external_baseline_qc_table = QTableWidget(0, 6)
         self.external_baseline_qc_table.setHorizontalHeaderLabels([
-            "长度", "通道", "实际候选", "合格", "不可用", "饱和", "平坦", "跳变", "响应/基线缺失", "状态",
+            "长度", "通道", "实际候选", "可计算", "非有限值/时间窗缺失", "状态",
         ])
         self.external_baseline_qc_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.external_baseline_qc_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -8925,7 +8855,7 @@ class QtAnalysisGUI(QMainWindow):
         self.external_baseline_qc_table.horizontalHeader().setStretchLastSection(True)
         external_baseline_layout.addWidget(self.external_baseline_qc_summary, 6, 0, 1, 8)
         external_baseline_layout.addWidget(self.external_baseline_qc_table, 7, 0, 1, 8)
-        itpc = QGroupBox("ITPC（复用 trial 五窗质量结果）")
+        itpc = QGroupBox("ITPC（直接使用对齐 marker，无五窗依赖）")
         itpc_grid = QGridLayout(itpc)
         self.itpc_tag_edit = QLineEdit()
         self.itpc_tag_edit.setPlaceholderText("tag；留空为全部")
@@ -8954,59 +8884,8 @@ class QtAnalysisGUI(QMainWindow):
         itpc_grid.addWidget(run_itpc, 1, 8); itpc_grid.addWidget(view_itpc, 1, 9); itpc_grid.addWidget(export_itpc, 1, 10)
         itpc_grid.addWidget(QLabel("参考窗 ms"), 2, 0); itpc_grid.addWidget(self.itpc_baseline_start, 2, 1)
         itpc_grid.addWidget(QLabel("至"), 2, 2); itpc_grid.addWidget(self.itpc_baseline_end, 2, 3)
-        itpc_grid.addWidget(QLabel("参考窗仅使用五窗 QC 覆盖的时间"), 2, 4, 1, 5)
-        self.lfp_qc_available_ratio_var = QLineEdit("0.995")
-        self.lfp_qc_saturation_run_var = QLineEdit("8")
-        self.lfp_qc_flat_epsilon_var = QLineEdit("1e-4")
-        self.lfp_qc_flat_ratio_var = QLineEdit("30")
-        self.lfp_qc_flat_ptp_var = QLineEdit("0.01")
-        self.lfp_qc_jump_mad_multiplier_var = QLineEdit("12")
-        self.lfp_qc_jump_median_multiplier_var = QLineEdit("8")
-        self.lfp_qc_jump_floor_multiplier_var = QLineEdit("10")
-        self.lfp_parameter_panel = self._legacy_parameter_panel("第 2 步：设置分析参数（高级参数可折叠）", [
-            "snr_mode_var", "snr_skip_var",
-            "psd_channel_source_var", "psd_page_size_var", "psd_welch_sec_var", "psd_overlap_var", "psd_freq_low_var", "psd_freq_high_var", "psd_scale_var", "psd_mark_stim_var", "psd_stim_freq_var", "psd_stim_harmonics_var", "psd_mask_stim_var", "psd_bandwidth_var",
-            "signal_band_low_var", "signal_band_high_var", "noise_band_low_var", "noise_band_high_var", "stim_interval_var", "stim_duration_var", "first_onset_var", "stim_freq_var", "task_target_freq_var", "harmonics_var", "neighbor_bins_var", "fft_len_var", "state_start_var", "state_duration_var", "epoch_start_ms_var", "epoch_end_ms_var", "baseline_start_ms_var", "baseline_end_ms_var", "response_start_ms_var", "response_end_ms_var", "trial_count_var", "n_stim_types_var", "trials_per_stim_var", "stimtag_var", "compare_trial_a_var", "compare_trial_b_var", "analysis_view_mode_var", "task_response_aggregate_var", "analysis_notch_var", "analysis_bandpass_var", "analysis_band_low_var", "analysis_band_high_var", "smooth_signal_var", "smooth_window_size_var", "zscoredata_var", "resting_page_size_var", "tvep_page_size_var", "auto_plot_marker_alignment_var"
-        ])
-        lfp_grid = self.lfp_parameter_panel.layout()
-        lfp_items = []
-        for index in range(lfp_grid.count()):
-            item = lfp_grid.itemAt(index); row, column, rowspan, colspan = lfp_grid.getItemPosition(index)
-            if item.widget() is not None:
-                lfp_items.append((item.widget(), row, column, rowspan, colspan))
-        for widget, row, column, rowspan, colspan in lfp_items:
-            lfp_grid.addWidget(widget, row + 2, column, rowspan, colspan)
-        lfp_grid.addWidget(QLabel("SNR 频段"), 0, 0)
-        lfp_grid.addWidget(band_holder, 1, 0, 1, 5)
-        qc_box = QGroupBox("trial 五窗 QC 阈值")
-        qc_form = QGridLayout(qc_box)
-        qc_form.setContentsMargins(7, 7, 7, 6)
-        qc_form.setHorizontalSpacing(8)
-        qc_form.setVerticalSpacing(4)
-        qc_fields = (
-            ("有限值比例 ≥", self.lfp_qc_available_ratio_var),
-            ("饱和连续相同采样点 ≥", self.lfp_qc_saturation_run_var),
-            ("平坦：相邻差值 ≤ mV", self.lfp_qc_flat_epsilon_var),
-            ("平坦：小差值比例 ≥ %", self.lfp_qc_flat_ratio_var),
-            ("平坦：窗口 PTP < mV", self.lfp_qc_flat_ptp_var),
-            ("跳变：MAD 系数", self.lfp_qc_jump_mad_multiplier_var),
-            ("跳变：中位差值系数", self.lfp_qc_jump_median_multiplier_var),
-            ("跳变：平坦阈值系数", self.lfp_qc_jump_floor_multiplier_var),
-        )
-        for index, (label, widget) in enumerate(qc_fields):
-            row, group = divmod(index, 4)
-            widget.setMinimumWidth(70)
-            widget.setMaximumWidth(105)
-            qc_form.addWidget(QLabel(label), row, group * 2)
-            qc_form.addWidget(widget, row, group * 2 + 1)
-        qc_form.setColumnStretch(8, 1)
-        qc_row = max(
-            (lfp_grid.getItemPosition(index)[0] + lfp_grid.getItemPosition(index)[2]
-             for index in range(lfp_grid.count())),
-            default=0,
-        )
-        lfp_grid.addWidget(qc_box, qc_row, 0, 1, 5)
-        self._make_collapsible(self.lfp_parameter_panel, collapsed=True)
+        itpc_grid.addWidget(QLabel("参考窗须位于 ITPC 计算时间内"), 2, 4, 1, 5)
+        self.lfp_parameter_panel = self._build_lfp_parameter_panel(band_holder)
         params.clicked.connect(lambda: self._toggle_parameter_section(self.lfp_parameter_panel))
         self.lfp_selected_summary_var = self.lfp_status
         self.lfp_task_status_var = self.lfp_status
@@ -10818,7 +10697,6 @@ class QtAnalysisGUI(QMainWindow):
         """Drop cached page-4 products when its channel scope changes."""
         self.lfp_rows = []
         self.lfp_multiband_results = None
-        self.lfp_trial_quality_output = None
         self.lfp_itpc_output = None
         self.task_results = None
         panel = getattr(self, "lfp_multiband_panel", None)
@@ -11166,36 +11044,42 @@ class QtAnalysisGUI(QMainWindow):
         self.pending_lfp_task_mode = str(mode)
         self._activate_page(3)
         self.lfp_status.setText(
-            f"已接收 {mode} 对齐 marker（{len(self.stim_markers)} 个）。请先点击“执行 trial 五窗质量判断”；Letter 对齐完成后可继续进行 Letter 任务分析。"
+            f"已接收 {mode} 对齐 marker（{len(self.stim_markers)} 个）。Letter 对齐完成后可直接进行 Letter 任务分析或扩展分析，无需五窗判断。"
         )
 
     def _run_alignment_letter_browser(self) -> None:
         """Restore page-3 Letter plotting without LFP frequency metrics."""
         self.run_task_epoch_analysis("lfp", "Letter", lfp_task_metrics=False)
 
-    def _lfp_quality_signature(self, mode: str, markers: np.ndarray, settings: dict) -> tuple:
-        """Identify the marker/channel/threshold state that a QC cache belongs to."""
+    def _lfp_task_signature(self, mode: str, markers: np.ndarray, settings: dict) -> tuple:
+        """Keep marker/source/processing freshness checks independent of retired QC."""
         source = self.lfp_source or self.active_source
         meta = source.metadata
         return (
             str(mode), tuple(np.asarray(markers, dtype=int).ravel().tolist()),
-            int(meta.rows), int(meta.channels), float(meta.fs), float(meta.time_offset),
+            id(source), id(getattr(source, "data", None)),
+            int(meta.rows), float(meta.fs), float(meta.time_offset),
             tuple(int(value) for value in meta.channel_ids),
             tuple(np.asarray(settings["columns"], dtype=int).tolist()),
-            float(settings["epoch_start"]), float(settings["epoch_end"]),
-            int(settings["trials_per_stim"]),
-            float(settings["quality_flat_epsilon"]),
-            float(settings["quality_flat_ratio_percent"]),
-            float(settings["quality_flat_ptp"]),
-            float(settings["quality_available_ratio"]),
-            int(settings["quality_saturation_run_samples"]),
-            float(settings["quality_jump_mad_multiplier"]),
-            float(settings["quality_jump_median_multiplier"]),
-            float(settings["quality_jump_flat_floor_multiplier"]),
+            float(settings["epoch_start"]), float(settings["epoch_end"]), int(settings["trials_per_stim"]),
             bool(settings.get("analysis_notch")), bool(settings.get("analysis_bandpass")),
             float(settings.get("analysis_band_low", .5)), float(settings.get("analysis_band_high", 300)),
             bool(settings.get("smooth")), float(settings.get("smooth_window_sec", .02)), bool(settings.get("zscore")),
         )
+
+    def _current_lfp_task_signature(self) -> tuple:
+        source = self.lfp_source or self.active_source
+        get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
+        settings = {
+            "columns": np.flatnonzero(np.isin(source.metadata.channel_ids, sorted(self._task_analysis_channel_ids(source)))),
+            "epoch_start": get("epoch_start_ms_var", -500), "epoch_end": get("epoch_end_ms_var", 6000),
+            "trials_per_stim": int(get("trials_per_stim_var", 30)),
+            "analysis_notch": self.analysis_notch_var.isChecked(), "analysis_bandpass": self.analysis_bandpass_var.isChecked(),
+            "analysis_band_low": get("analysis_band_low_var", .5), "analysis_band_high": get("analysis_band_high_var", 300),
+            "smooth": self.smooth_signal_var.isChecked(), "smooth_window_sec": get("smooth_window_size_var", .02),
+            "zscore": self.zscoredata_var.isChecked(),
+        }
+        return self._lfp_task_signature(str(getattr(self, "stim_marker_mode", "")), np.asarray(self.stim_markers), settings)
 
     def _external_baseline_task_signature(self, source, channel_ids, settings: dict) -> tuple:
         """Fingerprint the task-side conditions required for a valid comparison."""
@@ -11207,11 +11091,6 @@ class QtAnalysisGUI(QMainWindow):
             bool(settings.get("analysis_notch")), bool(settings.get("analysis_bandpass")),
             float(settings.get("analysis_band_low", .5)), float(settings.get("analysis_band_high", 300.0)),
             bool(settings.get("smooth")), float(settings.get("smooth_window_sec", .02)), bool(settings.get("zscore")),
-            float(settings["quality_flat_epsilon"]), float(settings["quality_flat_ratio_percent"]),
-            float(settings["quality_flat_ptp"]), float(settings["quality_available_ratio"]),
-            int(settings["quality_saturation_run_samples"]),
-            float(settings["quality_jump_mad_multiplier"]), float(settings["quality_jump_median_multiplier"]),
-            float(settings["quality_jump_flat_floor_multiplier"]),
             float(settings["epoch_start"]), float(settings["epoch_end"]),
             float(settings["baseline_start"]), float(settings["baseline_end"]),
             float(settings["response_start"]), float(settings["response_end"]),
@@ -11242,7 +11121,6 @@ class QtAnalysisGUI(QMainWindow):
             "external_time_response_start": self.external_time_response_start_spin.value(),
             "external_time_response_end": self.external_time_response_end_spin.value(),
             "external_time_rate_hz": 250.0,
-            **self._read_lfp_trial_quality_settings(),
         }
         if settings["zscore"]:
             raise ValueError("启用逐记录 z-score 时，任务与独立 baseline 的幅值标尺不可严格配对；请关闭 z-score 后准备 baseline。")
@@ -11271,7 +11149,7 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.critical(self, "导入 baseline 失败", str(exc))
 
     def prepare_external_baseline_reference(self) -> bool:
-        """Prepare independently QC'd 3/4/5 s references for page-4 task data."""
+        """Prepare length-matched 3/4/5 s references for page-4 task data."""
         baseline = self.external_baseline_source
         task_source = self.lfp_source or self.active_source
         if baseline is None or not baseline.loaded:
@@ -11345,7 +11223,7 @@ class QtAnalysisGUI(QMainWindow):
             QTimer.singleShot(0, self.run_external_time_frequency)
 
     def _render_external_baseline_qc_details(self, reference: dict) -> None:
-        """Show the per-length, per-channel QC evidence behind baseline eligibility."""
+        """Show numerical availability without artifact-window rejection columns."""
         table = self.external_baseline_qc_table
         rows = []
         minimum_valid = int(reference["minimum_valid_segments"])
@@ -11361,10 +11239,7 @@ class QtAnalysisGUI(QMainWindow):
                     status = f"合格片段不足（需 {minimum_valid}）"
                 rows.append((
                     f"{int(length)} s", f"ch{int(channel)}", str(actual_candidates), str(valid),
-                    str(int(item["rejected"]["unavailable"][index])),
-                    str(int(item["rejected"]["saturated"][index])),
-                    str(int(item["rejected"]["flat"][index])),
-                    str(int(item["rejected"]["jump"][index])), "0", status,
+                    str(int(item["rejected"]["nonfinite"][index])), status,
                 ))
         time_reference = reference.get("time_reference")
         if time_reference is not None:
@@ -11374,10 +11249,6 @@ class QtAnalysisGUI(QMainWindow):
                 status = "达标" if bool(time_reference["eligible"][index]) else f"合格伪 epoch 不足（需 {minimum_valid}）"
                 rows.append((
                     "时域", f"ch{int(channel)}", str(actual_candidates), str(valid),
-                    str(int(time_reference["rejected"]["unavailable"][index])),
-                    str(int(time_reference["rejected"]["saturated"][index])),
-                    str(int(time_reference["rejected"]["flat"][index])),
-                    str(int(time_reference["rejected"]["jump"][index])),
                     str(int(time_reference["rejected"]["response_missing"][index])), status,
                 ))
         table.setRowCount(len(rows))
@@ -11386,8 +11257,7 @@ class QtAnalysisGUI(QMainWindow):
                 table.setItem(row_index, column, QTableWidgetItem(value))
         table.resizeColumnsToContents()
         self.external_baseline_qc_summary.setText(
-            "拒绝计数按候选片段或时域伪 epoch 统计：一个候选片段只要包含至少一个对应失败的 1 s 窗口，"
-            "就在该原因列计 1；同一片段可同时出现在多个原因列。时域行另列出基线或响应窗有限值不足的计数。"
+            "不再进行平坦、饱和或跳变的五窗筛选；只列出非有限值及响应/基线时间窗缺失造成的不可计算片段。"
         )
 
     def _fail_external_baseline_reference(self, error: str) -> None:
@@ -11481,10 +11351,8 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "缺少选择", "请先在任务结果中选择 tag 和通道。")
             return
         try:
-            if output.get("quality_signature") is not None:
-                current_quality_signature = self._current_lfp_quality_signature()
-                if output.get("quality_signature") != current_quality_signature:
-                    raise ValueError("当前 marker、通道或五窗 QC 参数已改变，请重新运行任务分析后再计算时频图。")
+            if output.get("task_signature") is not None and output["task_signature"] != self._current_lfp_task_signature():
+                raise ValueError("当前数据、marker、通道或任务处理参数已改变，请重新运行任务分析后再计算时频图。")
             task_result = output["results"][int(tag_index)]
             if int(channel) not in {int(value) for value in output.get("channel_ids", [])}:
                 raise ValueError("所选通道不在当前任务结果中。")
@@ -11511,7 +11379,6 @@ class QtAnalysisGUI(QMainWindow):
                 "smooth": bool((output.get("task_processing") or {}).get("smooth")),
                 "smooth_window_sec": float((output.get("task_processing") or {}).get("smooth_window_sec", .02)),
                 "zscore": bool((output.get("task_processing") or {}).get("zscore")),
-                "quality_settings": self._read_lfp_trial_quality_settings(),
                 "freq_low": self.external_tf_freq_low_spin.value(), "freq_high": self.external_tf_freq_high_spin.value(),
                 "freq_step": self.external_tf_freq_step_spin.value(), "cycles": self.external_tf_cycles_spin.value(),
                 "sample_rate_hz": 250.0,
@@ -11533,6 +11400,54 @@ class QtAnalysisGUI(QMainWindow):
         self.external_time_frequency_button.setEnabled(False)
         self._update_lfp_progress(0, "正在计算任务-静息时频图…")
         worker.start()
+
+    def open_animal_peak_test(self) -> None:
+        """Open an independent experiment without modifying task parameters/results."""
+        source = self.lfp_source or self.active_source
+        if not source.loaded or not hasattr(self, "stim_markers") or getattr(self, "stim_marker_mode", None) != "Letter":
+            QMessageBox.information(self, "需要 Letter 对齐", "请先加载 LFP 数据，并在时间对齐页生成 Letter markers。")
+            return
+        matches = getattr(self, "behavior_matches", {})
+        if not matches:
+            QMessageBox.information(self, "缺少 AnimalStart 信息", "请在时间对齐页导入对应行为检测结果并计算对齐，获得 AnimalStart 时间。")
+            return
+        existing = getattr(self, "_animal_peak_test_dialog", None)
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_(); existing.activateWindow(); return
+            except RuntimeError:
+                pass
+        try:
+            get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
+            selected_ids = sorted(self._task_analysis_channel_ids(source))
+            if not selected_ids:
+                raise ValueError("请先选择用于测试的 LFP 通道。")
+            tags = [int(value.strip()) for value in self._widget_text(self.stimtag_var, "").replace(";", ",").split(",") if value.strip()]
+            n_types = max(0, int(get("n_stim_types_var", 0)))
+            available = sorted({int(tag) for _sample, tag in self.stim_markers if int(tag) in (4, 5, 6, 7)})
+            tags = [tag for tag in tags if tag in available] if tags else available
+            if n_types:
+                tags = tags[:n_types]
+            defaults = {
+                "channel_ids": selected_ids, "tags": tags,
+                "epoch_start_ms": get("epoch_start_ms_var", -500), "epoch_end_ms": get("epoch_end_ms_var", 6000),
+                "baseline_start_ms": get("baseline_start_ms_var", -200), "baseline_end_ms": get("baseline_end_ms_var", 0),
+                "trial_limit": max(0, int(get("trials_per_stim_var", 0)), int(get("compare_trial_a_var", 0)), int(get("compare_trial_b_var", 0))),
+                "processing": {
+                    "analysis_notch": self.analysis_notch_var.isChecked(), "analysis_bandpass": self.analysis_bandpass_var.isChecked(),
+                    "analysis_band_low": get("analysis_band_low_var", .5), "analysis_band_high": get("analysis_band_high_var", 300),
+                    "smooth": self.smooth_signal_var.isChecked(), "smooth_window_sec": get("smooth_window_size_var", .02),
+                    "zscore": self.zscoredata_var.isChecked(),
+                },
+            }
+            from animal_peak_dialog import AnimalPeakDialog
+            dialog = AnimalPeakDialog(self, source, self.stim_markers, matches, defaults)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            self._animal_peak_test_dialog = dialog
+            dialog.show()
+        except Exception as exc:
+            QMessageBox.warning(self, "测试参数无效", str(exc))
 
     def run_trial_vep_overlay(self) -> None:
         """Plot all complete marker epochs; this path deliberately skips five-window QC."""
@@ -11755,100 +11670,19 @@ class QtAnalysisGUI(QMainWindow):
         render()
         dialog.exec()
 
-    def _read_lfp_trial_quality_settings(self) -> dict:
-        """Read and validate the editable page-4 five-window QC thresholds."""
-        get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
-        settings = {
-            "quality_available_ratio": get("lfp_qc_available_ratio_var", .995),
-            "quality_saturation_run_samples": int(get("lfp_qc_saturation_run_var", 8)),
-            "quality_flat_epsilon": get("lfp_qc_flat_epsilon_var", 1e-4),
-            "quality_flat_ratio_percent": get("lfp_qc_flat_ratio_var", 30.0),
-            "quality_flat_ptp": get("lfp_qc_flat_ptp_var", .01),
-            "quality_jump_mad_multiplier": get("lfp_qc_jump_mad_multiplier_var", 12.0),
-            "quality_jump_median_multiplier": get("lfp_qc_jump_median_multiplier_var", 8.0),
-            "quality_jump_flat_floor_multiplier": get("lfp_qc_jump_floor_multiplier_var", 10.0),
-        }
-        if not 0 < settings["quality_available_ratio"] <= 1:
-            raise ValueError("五窗 QC 的有限值比例必须在 0 到 1 之间。")
-        if settings["quality_saturation_run_samples"] < 2:
-            raise ValueError("五窗 QC 的饱和连续采样点数至少为 2。")
-        if settings["quality_flat_epsilon"] < 0 or settings["quality_flat_ptp"] < 0:
-            raise ValueError("五窗 QC 的平坦阈值不能为负数。")
-        if not 0 <= settings["quality_flat_ratio_percent"] <= 100:
-            raise ValueError("五窗 QC 的平坦比例必须在 0 到 100 之间。")
-        if any(settings[name] < 0 for name in (
-            "quality_jump_mad_multiplier", "quality_jump_median_multiplier",
-            "quality_jump_flat_floor_multiplier",
-        )):
-            raise ValueError("五窗 QC 的跳变系数不能为负数。")
-        return settings
 
-    def _current_lfp_quality_signature(self) -> tuple:
-        """Build the current UI fingerprint required to reuse a QC cache."""
-        if not hasattr(self, "stim_markers"):
-            raise ValueError("请先在时间对齐页生成 marker。")
-        mode = str(getattr(self, "stim_marker_mode", "") or "")
-        if mode not in {"Flash", "Letter"}:
-            raise ValueError("当前 marker 没有有效的 Flash 或 Letter 模式。")
-        source = self.lfp_source or self.active_source
-        alignment_ids = self._task_analysis_channel_ids(source)
-        columns = np.flatnonzero(np.isin(source.metadata.channel_ids, sorted(alignment_ids)))
-        if not columns.size:
-            raise ValueError("当前对齐通道不在 LFP 数据源中。")
-        get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
-        settings = {
-            "columns": columns,
-            "epoch_start": get("epoch_start_ms_var", -500), "epoch_end": get("epoch_end_ms_var", 6000),
-            "trials_per_stim": int(get("trials_per_stim_var", 30)),
-            **self._read_lfp_trial_quality_settings(),
-            "analysis_notch": isinstance(self.analysis_notch_var, QCheckBox) and self.analysis_notch_var.isChecked(),
-            "analysis_bandpass": isinstance(self.analysis_bandpass_var, QCheckBox) and self.analysis_bandpass_var.isChecked(),
-            "analysis_band_low": get("analysis_band_low_var", .5), "analysis_band_high": get("analysis_band_high_var", 300),
-            "smooth": isinstance(self.smooth_signal_var, QCheckBox) and self.smooth_signal_var.isChecked(),
-            "smooth_window_sec": get("smooth_window_size_var", .02),
-            "zscore": isinstance(self.zscoredata_var, QCheckBox) and self.zscoredata_var.isChecked(),
-        }
-        return self._lfp_quality_signature(mode, np.asarray(self.stim_markers, dtype=int), settings)
 
-    def _validate_lfp_quality_cache(self, output: dict) -> str | None:
-        """Return a user-facing reason when cached page-4 QC is stale."""
-        source = self.lfp_source or self.active_source
-        meta = source.metadata
-        expected_source = (int(meta.rows), float(meta.fs), float(meta.time_offset), tuple(int(value) for value in meta.channel_ids))
-        if output.get("source_signature") != expected_source:
-            return "当前 LFP 数据源已改变。"
-        expected_identity = (id(source), id(getattr(source, "data", None)))
-        if output.get("source_identity") != expected_identity:
-            return "当前 LFP 数据对象或预处理版本已改变。"
-        try:
-            current_signature = self._current_lfp_quality_signature()
-        except ValueError as exc:
-            return str(exc)
-        if output.get("quality_signature") != current_signature:
-            return "marker、对齐通道、epoch、质量阈值或任务处理参数已改变。"
-        return None
 
-    def run_lfp_trial_quality_check(self) -> None:
-        """Run the page-4 five-window QC before any LFP task frequency analysis."""
-        mode = str(getattr(self, "stim_marker_mode", "") or "")
-        if mode not in {"Flash", "Letter"}:
-            QMessageBox.information(self, "尚未对齐", "请先在时间对齐页生成 Flash 或 Letter markers。")
-            return
-        self.run_task_epoch_analysis("lfp", mode, quality_only=True)
 
     def run_lfp_letter_frequency_analysis(self) -> None:
-        """Use the saved five-window QC cache for Letter PSD/task metrics."""
+        """Run Letter metrics directly on aligned complete epochs."""
         if getattr(self, "stim_marker_mode", None) != "Letter":
             QMessageBox.information(self, "需要 Letter 对齐", "请先在时间对齐页选择 Letter 并生成对应 markers。")
             return
-        if not getattr(self, "lfp_trial_quality_output", None):
-            QMessageBox.information(self, "尚未完成五窗判断", "请先点击“执行 trial 五窗质量判断”。")
-            return
-        self.run_task_epoch_analysis("lfp", "Letter", reuse_cached_quality=True)
+        self.run_task_epoch_analysis("lfp", "Letter")
 
     def run_task_epoch_analysis(
         self, stage: str, mode: str, *, lfp_task_metrics: bool | None = None,
-        quality_only: bool = False, reuse_cached_quality: bool = False,
     ) -> None:
         if not hasattr(self, "stim_markers"):
             QMessageBox.information(self, "尚未对齐", "请先在时间对齐页生成 Flash 或 Letter markers。")
@@ -11898,33 +11732,19 @@ class QtAnalysisGUI(QMainWindow):
                 "view_mode": self._widget_text(self.analysis_view_mode_var, "raw").lower(),
                 "compare_trial_a": int(get("compare_trial_a_var", 30)),
                 "compare_trial_b": int(get("compare_trial_b_var", 60)),
-                # Page 4 owns its five-window QC thresholds independently
-                # from the preprocessing-page bad-channel check.
-                **self._read_lfp_trial_quality_settings(),
                 "behavior_matches": dict(getattr(self, "behavior_matches", {})) if mode == "Letter" else {},
-                "quality_only": bool(quality_only),
             }
         except Exception as exc:
             QMessageBox.warning(self, "任务参数无效", str(exc)); return
         markers = np.asarray(self.stim_markers, dtype=int)
-        if quality_only:
-            # QC belongs to the aligned marker set itself, not to a later
-            # display subset selected through stimtag/nStimTypes.
-            settings["tags"] = []
-            settings["n_stim_types"] = 0
         if stage == "lfp":
-            settings["quality_signature"] = self._lfp_quality_signature(mode, markers, settings)
+            settings["task_signature"] = self._lfp_task_signature(mode, markers, settings)
             external_reference = getattr(self, "external_baseline_reference", None)
             task_channel_ids = [int(source.metadata.channel_ids[index]) for index in settings["columns"]]
             if external_reference is not None and external_reference.get("task_signature") == self._external_baseline_task_signature(
                 source, task_channel_ids, settings,
             ):
                 settings["external_baseline_reference"] = external_reference
-            if reuse_cached_quality:
-                cached = self.lfp_trial_quality_output
-                if cached.get("quality_signature") != settings["quality_signature"]:
-                    raise ValueError("当前 marker、通道、epoch 或质量阈值已改变；请先重新执行 trial 五窗质量判断。")
-                settings["precomputed_trial_quality"] = cached.get("trial_quality", {})
         if mode == "Letter" and not np.any(np.isin(markers[:, 1], [4, 5, 6, 7])):
             QMessageBox.warning(
                 self, "没有 Letter markers",
@@ -11948,8 +11768,6 @@ class QtAnalysisGUI(QMainWindow):
     def _set_task_buttons_enabled(self, stage: str, enabled: bool) -> None:
         prefix = "lfp" if stage == "lfp" else "spike"
         names = [f"{prefix}_flash_task_button", f"{prefix}_letter_task_button"]
-        if stage == "lfp":
-            names.append("lfp_trial_quality_button")
         for name in names:
             button = getattr(self, name, None)
             if button is not None:
@@ -11966,18 +11784,13 @@ class QtAnalysisGUI(QMainWindow):
             figure = self.lfp_figure if stage == "lfp" else self.spike_figure
             canvas = self.lfp_canvas if stage == "lfp" else self.spike_canvas
             figure.clear(); result = output["results"][0]; ids = output["channel_ids"]
-            if stage == "lfp" and output.get("quality_only", False):
-                self.lfp_trial_quality_output = output
-                self._render_lfp_trial_quality_summary(output)
-                self._update_task_progress(stage, 100, f"trial 五窗质量判断完成：{len(output['results'])} 个 tag；现在可进行 Letter 任务分析。")
-                return
             if mode == "Letter" and not output.get("lfp_task_metrics", False):
                 self._show_letter_behavior_browser(stage, output)
                 self._update_task_progress(stage, 100, f"Letter 任务完成：{len(output['results'])} 个 tag；已打开 Letter 视频关联通道浏览。")
                 return
             if mode == "Letter" and stage == "lfp" and output.get("lfp_task_metrics", False):
-                self._render_lfp_task_quality_summary(mode, output)
-                self._update_task_progress(stage, 100, f"Letter 五窗任务分析完成：{len(output['results'])} 个 tag；已显示质量控制和连续 PSD 结果。")
+                self._render_lfp_task_summary(mode, output)
+                self._update_task_progress(stage, 100, f"Letter 任务分析完成：{len(output['results'])} 个 tag；已显示任务指标和连续 PSD 结果。")
                 return
             axis = figure.add_subplot(111)
             for index in range(min(12, result["wave"].shape[1])):
@@ -11988,177 +11801,12 @@ class QtAnalysisGUI(QMainWindow):
         except Exception as exc:
             self._fail_task_epoch_analysis(stage, f"结果绘制失败：{exc}")
 
-    def _render_lfp_trial_quality_summary(self, output: dict) -> None:
-        """Render the saved page-4 trial QC result before PSD is requested."""
-        results = list(output.get("results") or [])
-        if not results:
-            raise ValueError("没有可显示的 trial 五窗质量判断结果。")
-        summary_lines = [
-            "trial 五窗质量判断完成（尚未计算 PSD 或频率指标）",
-            "稳态区间：0.5-5.5 s；五个连续 1 s 窗口为 W1 0.5-1.5、W2 1.5-2.5、W3 2.5-3.5、W4 3.5-4.5、W5 4.5-5.5 s。",
-            "完整五窗 trial 需至少 3 个干净窗；短 epoch 只评估实际完整存在的窗口，缺失窗口明确记为不可用。连续至少 2 个干净窗才能计算 PSD。",
-            "窗口检查项：数据可用性、饱和、平坦、突变；下方按通道列出累计结果。",
-        ]
-        channel_rates: dict[int, list[float]] = {}
-        for result in results:
-            metrics = list(result.get("metrics") or [])
-            trial_count = max(1, int(result["trials"]))
-            qualified_channels = sum(int(row["usable_trials"]) > 0 for row in metrics)
-            summary_lines.append(
-                f"\ntag {result['tag']}：完整 trial {result['trials']}，有至少一个可用 trial 的通道 {qualified_channels}/{len(metrics)}。"
-            )
-            for row in metrics:
-                channel = int(row["channel"])
-                usable = int(row["usable_trials"])
-                channel_rates.setdefault(channel, []).append(usable / trial_count * 100.0)
-                summary_lines.append(
-                    f"  ch{channel}: 可用/拒绝 trial {usable}/{row['rejected_trials']}，"
-                    f"完整可用/干净窗 {row.get('available_windows', 0)}/{row['clean_windows']}，短 epoch/仅响应 trial {row.get('short_epoch_trials', 0)}/{row.get('response_only_trials', 0)}，不可用/饱和/平坦/跳变窗 "
-                    f"{row['unavailable_windows']}/{row['saturated_windows']}/{row['flat_windows']}/{row['jump_windows']}。"
-                )
-        self.lfp_results.setPlainText("\n".join(summary_lines))
 
-        self.lfp_figure.clear()
-        axis = self.lfp_figure.add_subplot(111)
-        channels = np.asarray(sorted(channel_rates), dtype=float)
-        rates = np.asarray([np.mean(channel_rates[int(channel)]) for channel in channels], dtype=float)
-        axis.plot(channels, rates, color="#b71c1c", linewidth=.8, marker=".", markersize=5)
-        axis.set_xlabel("通道号")
-        axis.set_ylabel("可用 trial 比例 (%)")
-        axis.set_title("trial 五窗质量判断：各通道可用于后续 Letter 分析的 trial 比例")
-        axis.set_ylim(0, 100)
-        axis.grid(alpha=.25)
-        self.lfp_canvas.draw_idle()
-
-    def show_lfp_trial_quality_browser(self) -> None:
-        """Let users inspect a cached QC decision against its source epoch."""
-        output = getattr(self, "lfp_trial_quality_output", None)
-        if not output or not output.get("trial_quality"):
-            QMessageBox.information(self, "尚无五窗判断", "请先执行 trial 五窗质量判断。")
-            return
-        source = self.lfp_source or self.active_source
-        if not source.loaded:
-            QMessageBox.information(self, "尚未加载数据", "请先加载用于 LFP 分析的数据。")
-            return
-        stale_reason = self._validate_lfp_quality_cache(output)
-        if stale_reason:
-            QMessageBox.warning(self, "五窗缓存已失效", f"{stale_reason} 请重新执行 trial 五窗质量判断。")
-            return
-        quality_rows = output["trial_quality"]
-        keys = sorted((int(tag), int(sample)) for tag, sample in quality_rows)
-        channel_ids = [int(value) for value in output.get("channel_ids", [])]
-        if not keys or not channel_ids:
-            QMessageBox.information(self, "没有可查看的数据", "缓存中没有完整的 trial 或通道。")
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("trial 五窗质量浏览")
-        dialog.resize(980, 720)
-        layout = QVBoxLayout(dialog)
-        controls = QHBoxLayout()
-        tag_box = QComboBox()
-        for tag in sorted({tag for tag, _sample in keys}):
-            tag_box.addItem(f"tag {tag}", tag)
-        trial_box = QComboBox()
-        channel_box = QComboBox()
-        for index, channel in enumerate(channel_ids):
-            channel_box.addItem(f"ch{channel}", index)
-        controls.addWidget(QLabel("标签")); controls.addWidget(tag_box)
-        controls.addWidget(QLabel("trial")); controls.addWidget(trial_box)
-        controls.addWidget(QLabel("通道")); controls.addWidget(channel_box)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        status = QLabel()
-        status.setWordWrap(True)
-        layout.addWidget(status)
-        plot = PyQtGraphPlot(dialog)
-        layout.addWidget(plot, 1)
-        table = QTableWidget(5, 4, dialog)
-        table.setHorizontalHeaderLabels(["窗口", "时间（相对刺激）", "判断", "原因"])
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(table)
-
-        def populate_trials() -> None:
-            tag = int(tag_box.currentData())
-            trial_box.blockSignals(True)
-            trial_box.clear()
-            for key_tag, sample in keys:
-                if key_tag == tag:
-                    trial_box.addItem(f"样本 {sample}", (key_tag, sample))
-            trial_box.blockSignals(False)
-            render()
-
-        def render() -> None:
-            key = trial_box.currentData()
-            channel_index = channel_box.currentData()
-            if key is None or channel_index is None:
-                return
-            tag, sample = (int(key[0]), int(key[1]))
-            channel_index = int(channel_index)
-            saved = quality_rows[(tag, sample)]
-            meta = source.metadata
-            epoch_start_ms = float(output["epoch_start_ms"])
-            epoch_end_ms = float(output["epoch_end_ms"])
-            start = int(round(epoch_start_ms * meta.fs / 1000.0))
-            end = int(round(epoch_end_ms * meta.fs / 1000.0))
-            marker_offset = int(round(float(meta.time_offset) * meta.fs))
-            center = sample - marker_offset
-            values = np.asarray(source.read(center + start, center + end, int(output["columns"][channel_index])), dtype=float).ravel()
-            t_ms = np.arange(values.size, dtype=float) / meta.fs * 1000.0 + epoch_start_ms
-            baseline = (t_ms >= float(output["baseline_start_ms"])) & (t_ms <= float(output["baseline_end_ms"]))
-            if np.any(baseline):
-                values = values - np.nanmean(values[baseline])
-
-            clean = np.asarray(saved["clean_windows"], dtype=bool)[:, channel_index]
-            available = np.asarray(saved["available"], dtype=bool)[:, channel_index]
-            plot.clear()
-            plot.plot(t_ms, values, pen=pg.mkPen("#9aa8b1", width=1))
-            color_by_reason = {"saturated": "#c62828", "flat": "#ef6c00", "jump": "#7b1fa2"}
-            reasons_by_window = []
-            for number in range(5):
-                left, right = 500.0 + number * 1000.0, 1500.0 + number * 1000.0
-                plot.addItem(pg.InfiniteLine(pos=left, angle=90, movable=False, pen=pg.mkPen("#78909c", width=1)))
-                in_window = (t_ms >= left) & (t_ms < right)
-                if not available[number]:
-                    judgment, reason, color = "不可用", "epoch 未完整覆盖或数据缺失", "#757575"
-                elif clean[number]:
-                    judgment, reason, color = "干净", "通过", "#2e7d32"
-                else:
-                    failed = [name for name in ("saturated", "flat", "jump") if np.asarray(saved[name], dtype=bool)[number, channel_index]]
-                    judgment, reason = "拒绝", "、".join({"saturated": "饱和", "flat": "平坦", "jump": "突变"}[name] for name in failed)
-                    color = color_by_reason.get(failed[0], "#c62828") if failed else "#c62828"
-                reasons_by_window.append((judgment, reason))
-                if np.any(in_window):
-                    plot.plot(t_ms[in_window], values[in_window], pen=pg.mkPen(color, width=2))
-                table.setItem(number, 0, QTableWidgetItem(f"W{number + 1}"))
-                table.setItem(number, 1, QTableWidgetItem(f"{left / 1000:.1f}–{right / 1000:.1f} s"))
-                table.setItem(number, 2, QTableWidgetItem(judgment))
-                table.setItem(number, 3, QTableWidgetItem(reason))
-            plot.addItem(pg.InfiniteLine(pos=5500.0, angle=90, movable=False, pen=pg.mkPen("#78909c", width=1)))
-            plot.setLabel("bottom", "相对刺激时间（ms）")
-            plot.setLabel("left", "幅值（当前 LFP 数据源，baseline 校正）")
-            plot.setTitle(f"tag {tag}，样本 {sample}，ch{channel_ids[channel_index]}：绿=干净，红/橙/紫=拒绝，灰=不可用")
-            plot.setXRange(epoch_start_ms, epoch_end_ms, padding=0)
-            status.setText(
-                f"该图使用当前 LFP 数据源的单个 epoch；五窗判断来自已缓存的 QC。"
-                f"完整可用窗 {int(np.sum(available))}/5，干净窗 {int(np.sum(clean))}/5。"
-            )
-
-        tag_box.currentIndexChanged.connect(populate_trials)
-        trial_box.currentIndexChanged.connect(render)
-        channel_box.currentIndexChanged.connect(render)
-        populate_trials()
-        dialog.exec()
 
     def run_lfp_itpc(self) -> None:
-        quality = getattr(self, "lfp_trial_quality_output", None)
-        if not quality or not quality.get("trial_quality"):
-            QMessageBox.information(self, "尚无五窗判断", "请先执行 trial 五窗质量判断，再计算 ITPC。")
-            return
-        stale_reason = self._validate_lfp_quality_cache(quality)
-        if stale_reason:
-            QMessageBox.warning(self, "五窗缓存已失效", f"{stale_reason} 请重新执行 trial 五窗质量判断。")
+        source = self.lfp_source or self.active_source
+        if not source.loaded or not hasattr(self, "stim_markers"):
+            QMessageBox.information(self, "尚未对齐", "请先加载 LFP 数据并完成时间对齐，再计算 ITPC。")
             return
         try:
             tags = [int(value.strip()) for value in self.itpc_tag_edit.text().replace(";", ",").split(",") if value.strip()]
@@ -12176,13 +11824,38 @@ class QtAnalysisGUI(QMainWindow):
                 raise ValueError("ITPC 参考窗终点必须大于起点。")
         except ValueError as exc:
             QMessageBox.warning(self, "ITPC 参数无效", str(exc)); return
-        source = self.lfp_source or self.active_source
-        worker = ItpcWorker(source, quality, settings)
+        get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
+        try:
+            columns = np.flatnonzero(np.isin(source.metadata.channel_ids, sorted(self._task_analysis_channel_ids(source))))
+            if not columns.size:
+                raise ValueError("没有可用于 ITPC 的 LFP 通道。")
+            context = {
+                "columns": columns, "channel_ids": np.asarray(source.metadata.channel_ids)[columns],
+                "markers": np.asarray(self.stim_markers, dtype=np.int64),
+                "epoch_start_ms": get("epoch_start_ms_var", -500), "epoch_end_ms": get("epoch_end_ms_var", 6000),
+                "trial_limit": max(
+                    0, int(get("trials_per_stim_var", 0)),
+                    int(get("compare_trial_a_var", 0)) if getattr(self, "stim_marker_mode", "") == "Letter" else 0,
+                    int(get("compare_trial_b_var", 0)) if getattr(self, "stim_marker_mode", "") == "Letter" else 0,
+                ),
+                "task_processing": {
+                    "analysis_notch": self.analysis_notch_var.isChecked(),
+                    "analysis_bandpass": self.analysis_bandpass_var.isChecked(),
+                    "analysis_band_low": get("analysis_band_low_var", .5), "analysis_band_high": get("analysis_band_high_var", 300),
+                    "smooth": self.smooth_signal_var.isChecked(), "smooth_window_sec": get("smooth_window_size_var", .02),
+                    "zscore": self.zscoredata_var.isChecked(),
+                },
+            }
+            if context["epoch_end_ms"] <= context["epoch_start_ms"]:
+                raise ValueError("Epoch 终点必须大于起点。")
+        except ValueError as exc:
+            QMessageBox.warning(self, "ITPC 参数无效", str(exc)); return
+        worker = ItpcWorker(source, context, settings)
         worker.progress.connect(lambda value, text: self._update_lfp_progress(value, text))
         worker.completed.connect(self._finish_lfp_itpc)
         worker.failed.connect(self._fail_lfp_itpc)
         self._lfp_itpc_worker = worker
-        self.lfp_status.setText("正在计算 marker 对齐 ITPC（复用五窗 QC）…")
+        self.lfp_status.setText("正在计算 marker 对齐 ITPC…")
         worker.start()
 
     def _finish_lfp_itpc(self, output: dict) -> None:
@@ -12236,7 +11909,7 @@ class QtAnalysisGUI(QMainWindow):
             image.setRect(QRectF(float(t[0]), float(f[0]), max(.001, float(t[-1] - t[0])), max(.001, float(f[-1] - f[0]))))
             plot.addItem(image); plot.setXRange(float(t[0]), float(t[-1]), padding=0); plot.setYRange(float(f[0]), float(f[-1]), padding=0)
             count = np.asarray(result["counts"][:, :, channel])
-            status.setText(f"ITPC 范围 0–1；参考窗 {output['baseline_start']:g}–{output['baseline_end']:g} ms。该 tag 有 {result['trials']} 个 QC 缓存 trial，显示点要求至少 {output['min_trials']} 个有效 trial。有效 trial 数：{int(np.nanmin(count))}–{int(np.nanmax(count))}。")
+            status.setText(f"ITPC 范围 0–1；参考窗 {output['baseline_start']:g}–{output['baseline_end']:g} ms。该 tag 有 {result['trials']} 个完整 trial，显示点要求至少 {output['min_trials']} 个有效 trial。有效 trial 数：{int(np.nanmin(count))}–{int(np.nanmax(count))}。")
 
         tag_box.currentIndexChanged.connect(render); channel_box.currentIndexChanged.connect(render); metric_box.currentIndexChanged.connect(render)
         render(); dialog.exec()
@@ -12427,7 +12100,7 @@ class QtAnalysisGUI(QMainWindow):
             seconds = float(metric.get("spectral_seconds", np.nan))
             snr = float(metric.get("local_tag_snr_db", np.nan))
             if not np.isfinite(seconds) or seconds <= 0:
-                state = "无连续干净片段可计算 PSD"
+                state = "稳态区间内连续数据不足 2 s，无法计算 PSD"
             elif not np.isfinite(snr):
                 state = "目标频率或邻频噪声无有效值"
             else:
@@ -12527,18 +12200,17 @@ class QtAnalysisGUI(QMainWindow):
         axis.grid(alpha=.25)
         self.lfp_canvas.draw_idle()
 
-    def _render_lfp_task_quality_summary(self, mode: str, output: dict) -> None:
-        """Show page-4 LFP task QC/PSD results without Letter marker browser lines."""
+    def _render_lfp_task_summary(self, mode: str, output: dict) -> None:
+        """Show LFP task metrics without artifact-window QC summaries."""
         results = list(output.get("results") or [])
         channel_ids = np.asarray(output.get("channel_ids", []), dtype=int)
         if not results or channel_ids.size == 0:
-            raise ValueError("没有可显示的 LFP 五窗任务结果。")
+            raise ValueError("没有可显示的 LFP 任务结果。")
 
         summary_lines = [
-            f"{mode} LFP 五窗任务分析完成",
-            "质量控制：稳态区间 0.5-5.5 s 被划分为 5 个连续 1 s 窗口：W1 0.5-1.5、W2 1.5-2.5、W3 2.5-3.5、W4 3.5-4.5、W5 4.5-5.5 s。",
-            "纳入规则：每个 通道 x trial 至少 3 个干净窗口才进入任务响应聚合。",
-            "PSD 规则：仅对连续且长度不少于 2 s 的干净窗口段计算 Welch PSD；不拼接不连续窗口。",
+            f"{mode} LFP 任务分析完成",
+            "纳入规则：按当前 Tag、Trial 和通道设置读取完整 Epoch，不进行五窗质量筛选。",
+            "PSD 规则：沿用刺激后 0.5-5.5 s 连续稳态区间，实际连续数据至少 2 s；公式及聚合规则不变。",
         ]
         plot_channels, plot_snr = [], []
         for result in results:
@@ -12558,8 +12230,6 @@ class QtAnalysisGUI(QMainWindow):
                 event_snr = float(row.get("event_lfp_snr_db", np.nan))
                 summary_lines.append(
                     f"  ch{channel}: 可用/拒绝 trial {int(usable[index]) if index < usable.size else row['usable_trials']}/{row['rejected_trials']}，"
-                    f"完整可用/干净窗 {row.get('available_windows', 0)}/{row['clean_windows']}，短 epoch/仅响应 trial {row.get('short_epoch_trials', 0)}/{row.get('response_only_trials', 0)}"
-                    f"（不可用/饱和/平坦/跳变：{row['unavailable_windows']}/{row['saturated_windows']}/{row['flat_windows']}/{row['jump_windows']}），"
                     f"连续 PSD {float(spectral_seconds[index]) if index < spectral_seconds.size else row['spectral_seconds']:.2f} s，"
                     f"功率变化 {change:.3f} dB，local tag-SNR {snr:.3f} dB，"
                     f"事件锁定 LFP SNR {event_snr:.3f} dB；"

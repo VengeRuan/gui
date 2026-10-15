@@ -38,7 +38,6 @@ from qt_gui import (
     ExternalTimeFrequencyWorker,
     TrialVepWorker,
     TaskEpochWorker,
-    evaluate_task_trial_window_quality,
 )
 
 
@@ -257,27 +256,16 @@ def main() -> int:
     vep, = run_worker(TrialVepWorker(source, task["results"][0], 500, task))
     assert vep["qc_applied"] is False and vep["trials"].shape[0] == 1
 
-    # Five 1-second windows are checked in one vectorized operation.  A flat
-    # channel, a clipped plateau and a large jump must not pass the 3/5 rule.
+    # Flat channels, clipping and jumps are no longer rejected by LFP trial QC.
     epoch = rng.normal(0, .05, size=(int(6.5 * 250), 4)).astype(np.float32)
     epoch[:, 1] = 0.0
     for window in range(5):
         first = int((1.0 + window) * 250)  # 0.5 s after marker; epoch starts at -0.5 s.
         epoch[first:first + 12, 2] = .75
         epoch[first + 100, 3] = 30.0
-    clean, quality = evaluate_task_trial_window_quality(epoch, 250, -500)
-    assert clean.shape == (5, 4) and np.all(clean[:, 0])
-    assert not np.any(clean[:, 1]) and np.all(quality["flat"][:, 1])
-    assert not np.any(clean[:, 2]) and np.all(quality["saturated"][:, 2])
-    assert not np.any(clean[:, 3]) and np.all(quality["jump"][:, 3])
 
-    # A three-second response epoch contains W1/W2 but not W3-W5.  Missing
-    # windows must be unavailable rather than silently counted as clean, and
-    # the two consecutive clean seconds still support the short PSD path.
+    # A short epoch uses the actual continuous intersection with 0.5–5.5 s.
     short_values = (.05 * np.sin(2 * np.pi * 10 * np.arange(875) / 250)).astype(np.float32)[:, None]
-    short_clean, short_quality = evaluate_task_trial_window_quality(short_values, 250, -500)
-    assert np.all(short_clean[:2, 0]) and not np.any(short_clean[2:, 0])
-    assert np.all(short_quality["available"][:2, 0]) and np.all(short_quality["unavailable"][2:, 0])
     short_source = ArraySource(np.vstack([short_values, short_values[:125]]), 250, channel_ids=[10])
     short_task, = run_worker(TaskEpochWorker(
         short_source, np.asarray([[125, 2]]),
@@ -288,19 +276,16 @@ def main() -> int:
     ))
     short_metric = short_task["results"][0]["metrics"][0]
     assert short_metric["usable_trials"] == 1
-    assert short_metric["available_windows"] == 2 and short_metric["clean_windows"] == 2
-    assert short_metric["short_epoch_trials"] == 1 and short_metric["spectral_seconds"] == 2.0
+    assert "clean_windows" not in short_metric
+    assert short_metric["spectral_seconds"] == 2.5
 
-    # ITPC reuses the cached per-trial five-window mask and preserves marker
+    # ITPC uses markers directly, without a trial-quality cache, and preserves marker
     # phase.  Six 10 Hz trials with identical marker phase must lock near 1.
     itpc_fs, itpc_markers = 100, np.asarray([[1000 + 1000 * index, 2] for index in range(6)])
     itpc_source = ArraySource(np.sin(2 * np.pi * 10 * np.arange(8000) / itpc_fs).astype(np.float32)[:, None], itpc_fs, channel_ids=[10])
     itpc_quality = {
         "columns": np.asarray([0]), "channel_ids": [10], "epoch_start_ms": -500.0,
-        "epoch_end_ms": 6000.0, "trial_quality": {
-            (2, int(sample)): {"clean_windows": np.ones((5, 1), dtype=bool)}
-            for sample, _tag in itpc_markers
-        },
+        "epoch_end_ms": 6000.0, "markers": itpc_markers,
     }
     itpc, = run_worker(ItpcWorker(itpc_source, itpc_quality, {
         "tags": [2], "freq_low": 10.0, "freq_high": 10.0, "freq_step": 1.0,
@@ -317,17 +302,15 @@ def main() -> int:
     sine_windows = np.stack([np.sin(2 * np.pi * t) for _ in range(5)], axis=0)[:, :, None]
     target_power, neighbor_power = compute_task_window_spectral_metrics(sine_windows, 250, 1.0, 4)
     assert np.all(target_power > neighbor_power * 10)
-    # W1/W2 and W4/W5 are separate 2-second PSD segments.  They are not
-    # joined through the failed W3 interval, yet their target PSD contributes.
-    clean_runs = np.asarray([[True], [True], [False], [True], [True]])
-    epoch_for_psd = np.vstack([np.zeros((125, 1)), sine_windows.reshape(-1, 1), np.zeros((125, 1))])
+    # PSD uses one continuous steady interval, with no artificial QC gaps.
+    epoch_for_psd = np.vstack([np.zeros((250, 1)), sine_windows.reshape(-1, 1), np.zeros((125, 1))])
     run_target, run_neighbor, run_samples, run_segments = compute_task_continuous_psd_metrics(
-        epoch_for_psd, clean_runs, np.asarray([True]), 250, -500, 1.0, 4,
+        epoch_for_psd, 250, -500, 1.0, 4,
     )
-    assert run_samples[0] == 4 * 250 and run_segments[0] == 2
+    assert run_samples[0] == 5 * 250 and run_segments[0] == 1
     assert run_target[0] > run_neighbor[0] * 5
 
-    # External pre-task baseline references use independently QC'd natural
+    # External pre-task baseline references use natural
     # 3/4/5 s slices.  A task run is paired only with its exact length.
     baseline_fs = 100.0
     baseline_time = np.arange(int(60 * baseline_fs), dtype=float) / baseline_fs
@@ -345,25 +328,20 @@ def main() -> int:
             "baseline_candidate_count": 8, "baseline_min_valid_segments": 4,
             "baseline_random_seed": 8, "analysis_notch": False,
             "analysis_bandpass": False, "smooth": False,
-            "quality_flat_epsilon": 1e-4, "quality_flat_ratio_percent": 30.0,
-            "quality_flat_ptp": .01, "quality_available_ratio": .995,
-            "quality_saturation_run_samples": 8, "quality_jump_mad_multiplier": 12.0,
-            "quality_jump_median_multiplier": 8.0, "quality_jump_flat_floor_multiplier": 10.0,
         },
     )
     assert set(external_reference["references"]) == {3, 4, 5}
     assert np.all(external_reference["references"][5]["eligible"])
-    three_window_epoch = np.full((int(5.5 * baseline_fs), 1), np.nan, dtype=np.float32)
+    three_window_epoch = np.zeros((int(4.0 * baseline_fs), 1), dtype=np.float32)
     three_window_epoch[:int(1.0 * baseline_fs)] = 0.0
     three_window_epoch[int(1.0 * baseline_fs):int(4.0 * baseline_fs)] = (
         .08 * np.sin(2 * np.pi * 5 * np.arange(int(3 * baseline_fs)) / baseline_fs)
     )[:, None]
-    three_clean, _ = evaluate_task_trial_window_quality(three_window_epoch, baseline_fs, -500)
     by_length = compute_task_psd_metrics_by_run_length(
-        three_window_epoch, three_clean, np.asarray([True]), baseline_fs, -500, 5.0, 2,
+        three_window_epoch, baseline_fs, -500, 5.0, 2,
     )
     assert by_length[3][2][0] == int(3 * baseline_fs)
-    assert by_length[4][2][0] == 0 and by_length[5][2][0] == 0
+    assert set(by_length) == {3}
     external_task_source = ArraySource(
         (.08 * np.sin(2 * np.pi * 5 * np.arange(800) / baseline_fs)).astype(np.float32)[:, None],
         baseline_fs, channel_ids=[10],
@@ -407,10 +385,6 @@ def main() -> int:
             "baseline_candidate_count": 4, "baseline_min_valid_segments": 3,
             "baseline_random_seed": 9, "analysis_notch": False,
             "analysis_bandpass": False, "smooth": False,
-            "quality_flat_epsilon": 1e-4, "quality_flat_ratio_percent": 30.0,
-            "quality_flat_ptp": .01, "quality_available_ratio": .995,
-            "quality_saturation_run_samples": 8, "quality_jump_mad_multiplier": 12.0,
-            "quality_jump_median_multiplier": 8.0, "quality_jump_flat_floor_multiplier": 10.0,
             "epoch_start": -500.0, "epoch_end": 6000.0,
             "baseline_start": -200.0, "baseline_end": 0.0,
             "response_start": 0.0, "response_end": 300.0,
@@ -440,12 +414,6 @@ def main() -> int:
             "analysis_notch": False, "analysis_bandpass": False,
             "analysis_band_low": .5, "analysis_band_high": 300.0,
             "smooth": False, "smooth_window_sec": .02, "zscore": False,
-            "quality_settings": {
-                "quality_flat_epsilon": 1e-4, "quality_flat_ratio_percent": 30.0,
-                "quality_flat_ptp": .01, "quality_available_ratio": .995,
-                "quality_saturation_run_samples": 8, "quality_jump_mad_multiplier": 12.0,
-                "quality_jump_median_multiplier": 8.0, "quality_jump_flat_floor_multiplier": 10.0,
-            },
             "freq_low": 15.0, "freq_high": 25.0, "freq_step": 5.0,
             "cycles": 2.0, "sample_rate_hz": 100.0,
         },
@@ -469,31 +437,10 @@ def main() -> int:
     assert quality_metrics[0]["target_freq_hz"] == 1.0
     assert quality_metrics[0]["spectral_seconds"] == 5.0
     assert quality_metrics[0]["spectral_segments"] == 1
-    assert quality_metrics[1]["usable_trials"] == 0
-    assert quality_metrics[2]["saturated_windows"] == 5
-    assert quality_metrics[3]["jump_windows"] == 5
+    assert all(row["usable_trials"] == 1 for row in quality_metrics)
+    assert all("saturated_windows" not in row and "jump_windows" not in row for row in quality_metrics)
 
-    # Page 4 first runs QC only, then reuses its exact per-trial window
-    # decisions for frequency metrics rather than evaluating the windows again.
-    qc_only, = run_worker(TaskEpochWorker(
-        quality_source, np.asarray([[125, 2]]),
-        {"epoch_start": -500, "epoch_end": 6000, "baseline_start": -200,
-         "baseline_end": 0, "response_start": 0, "response_end": 300,
-         "trials_per_stim": 0, "tags": [2], "aggregate": "mean",
-         "columns": [0, 1, 2, 3], "task_target_freq_hz": 1.0,
-         "task_neighbor_bins": 4, "quality_only": True, "quality_signature": ("qc",)},
-    ))
-    assert qc_only["quality_only"] and (2, 125) in qc_only["trial_quality"]
-    assert qc_only["results"][0]["metrics"][0]["spectral_seconds"] == 0.0
-    reused_qc, = run_worker(TaskEpochWorker(
-        quality_source, np.asarray([[125, 2]]),
-        {"epoch_start": -500, "epoch_end": 6000, "baseline_start": -200,
-         "baseline_end": 0, "response_start": 0, "response_end": 300,
-         "trials_per_stim": 0, "tags": [2], "aggregate": "mean",
-         "columns": [0, 1, 2, 3], "task_target_freq_hz": 1.0,
-         "task_neighbor_bins": 4, "precomputed_trial_quality": qc_only["trial_quality"]},
-    ))
-    assert reused_qc["results"][0]["metrics"][0]["spectral_seconds"] == 5.0
+    assert "trial_quality" not in quality_task and "quality_signature" not in quality_task
 
     # Page-3 Letter browser keeps its legacy epoch/video plotting path.  It
     # must not apply the page-4 LFP five-window or PSD metrics.
