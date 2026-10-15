@@ -37,6 +37,49 @@ def fixture():
 
 
 class AnimalPeakAnalysisTests(unittest.TestCase):
+    def test_after_search_finds_post_event_extrema_only_inside_requested_range(self):
+        source, markers, matches, settings = fixture()
+        original = source.data.copy()
+        source.data[3080, 0] = 15
+        source.data[3120, 0] = -17
+        source.data[3200, 0] = 99  # Right endpoint is excluded.
+        before = analyze_animal_peaks(source, markers[:1], matches, settings)
+        self.assertTrue(all(row["extreme_relative_ms"] < 0 for g in before["groups"] for row in g["rows"]))
+        self.assertEqual(before["settings"]["search_after_ms"], 0)
+        data_before_run = source.data.copy()
+        output = analyze_animal_peaks(source, markers[:1], matches, {**settings, "search_after_ms": 200})
+        peak = next(g for g in output["groups"] if g["channel"] == 7 and g["branch"] == "peak")
+        trough = next(g for g in output["groups"] if g["channel"] == 7 and g["branch"] == "trough")
+        self.assertEqual(peak["rows"][0]["extreme_relative_ms"], 80)
+        self.assertEqual(trough["rows"][0]["extreme_relative_ms"], 120)
+        self.assertEqual(peak["rows"][0]["search_last"], 3200)
+        np.testing.assert_array_equal(source.data, data_before_run)
+        self.assertEqual(peak["waves"].shape[1], 101)  # Excerpt size unchanged.
+        time_ms, _ = trial_detail_trace(source, output, [peak["rows"][0]])
+        self.assertEqual(time_ms.max(), 199)
+        self.assertFalse(np.array_equal(original, source.data))  # Fixture edits only.
+
+    def test_after_search_requires_full_epoch_coverage_and_valid_parameter(self):
+        source, markers, matches, settings = fixture()
+        output = analyze_animal_peaks(source, markers[:1], matches, {**settings, "search_after_ms": 1000})
+        self.assertTrue(output["groups"])  # Search ends exactly at Epoch's exclusive end.
+        output = analyze_animal_peaks(source, markers[:1], matches, {**settings, "search_after_ms": 1001})
+        self.assertFalse(output["groups"])
+        self.assertIn("完整搜索范围", output["records"][0]["reason"])
+        for invalid in (-1, np.nan, np.inf):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                analyze_animal_peaks(source, markers, matches, {**settings, "search_after_ms": invalid})
+
+    def test_equal_extrema_in_two_sided_search_choose_nearest_then_latest(self):
+        source, markers, matches, settings = fixture()
+        source.data[:] = 0
+        source.data[[2900, 3010, 3150], 0] = 5
+        source.data[[2980, 3020, 3170], 0] = -7
+        output = analyze_animal_peaks(source, markers[:1], matches,
+                                      {**settings, "channel_ids": [7], "search_after_ms": 200})
+        relative = {group["branch"]: group["rows"][0]["extreme_relative_ms"] for group in output["groups"]}
+        self.assertEqual(relative, {"peak": 10, "trough": 20})
+
     def test_largest_extrema_per_channel_not_nearest_and_no_mutation(self):
         source, markers, matches, settings = fixture()
         original = source.data.copy()
@@ -134,11 +177,14 @@ class AnimalPeakAnalysisTests(unittest.TestCase):
 
     def test_export_includes_tag_trial_labels_figures_data_and_manifest(self):
         source, markers, matches, settings = fixture()
-        output = analyze_animal_peaks(source, markers[:1], matches, {**settings, "channel_ids": [7]})
+        source.data[3050, 0] = 15
+        output = analyze_animal_peaks(source, markers[:1], matches,
+                                      {**settings, "channel_ids": [7], "search_after_ms": 100})
         with tempfile.TemporaryDirectory() as directory:
             folder = export_animal_peak_results(output, source, directory, individual_png=True)
             manifest = json.loads((folder/"parameters.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["settings"]["search_after_ms"], 100)
             self.assertTrue((folder/"ch7_tag4_trial00001_detail.png").is_file())
             self.assertTrue((folder/"ch7_tag4_summary.png").is_file())
             self.assertTrue((folder/"ch7_tag4_summary.pdf").is_file())
@@ -150,6 +196,7 @@ class AnimalPeakAnalysisTests(unittest.TestCase):
             with (folder/"trial_details.csv").open(encoding="utf-8-sig") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual({row["branch"] for row in rows}, {"peak", "trough"})
+            self.assertEqual(float(next(row for row in rows if row["branch"] == "peak")["extreme_relative_ms"]), 50)
             self.assertTrue(all(row["trial_id"] == "1" and row["tag"] == "4" for row in rows))
             with np.load(folder/"ch7_tag4_peak.npz") as saved:
                 self.assertEqual(saved["tag"], 4)

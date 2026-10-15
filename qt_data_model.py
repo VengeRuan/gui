@@ -1143,7 +1143,7 @@ def read_behavior_detection_results(path: str | Path) -> tuple[float, float, lis
     if text is None:
         text = path.read_text(errors="ignore")
     frame_rate, recording_time, events = 30.0, np.nan, []
-    for line in text.splitlines():
+    for line_number, line in enumerate(text.splitlines(), start=1):
         value = line.strip()
         if not value:
             continue
@@ -1167,9 +1167,14 @@ def read_behavior_detection_results(path: str | Path) -> tuple[float, float, lis
             continue
         try:
             animal_start = None if fields[3].upper() in {"", "NA", "NAN", "NONE"} else int(float(fields[3]))
+            animal_status = "missing" if animal_start is None else "parsed"
         except ValueError:
             animal_start = None
-        events.append({"tag": tag, "start_frame": start_frame, "end_frame": end_frame, "animal_start_frame": animal_start, "validity": fields[4].upper()})
+            animal_status = "unparseable"
+        events.append({"tag": tag, "start_frame": start_frame, "end_frame": end_frame,
+                       "animal_start_frame": animal_start, "validity": fields[4].upper(),
+                       "animal_start_raw": fields[3], "animal_start_status": animal_status,
+                       "validity_raw": fields[4], "detection_line_number": line_number})
     if not events or not np.isfinite(frame_rate) or frame_rate <= 0:
         raise ValueError("Detection results contain no valid events or frame rate.")
     return float(frame_rate), float(recording_time), events
@@ -1241,6 +1246,9 @@ def match_behavior_events_to_markers(
         )
         matched[sample] = {
             "tag": tag, "marker_sec": marker_sec,
+            **{name: event.get(name, "") for name in (
+                "animal_start_raw", "animal_start_status", "validity_raw", "detection_line_number",
+            )},
             "visual_start_latency_sec": detection_start_eeg_sec - marker_sec,
             "animal_latency_sec": animal_latency, "validity": event.get("validity", ""),
             "start_frame": event["start_frame"], "animal_start_frame": animal_frame,

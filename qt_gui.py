@@ -2780,6 +2780,32 @@ class CooperativeWorker(QThread):
                 raise CooperativeTaskCancelled()
 
 
+class CancellableAnalysisWorker(QThread):
+    """Stop analysis at safe checkpoints, never terminate a thread in native code."""
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._analysis_cancel_requested = False
+
+    def cancel(self) -> None:
+        self._analysis_cancel_requested = True
+        self.requestInterruption()
+
+    def _checkpoint(self) -> None:
+        if self._analysis_cancel_requested or self.isInterruptionRequested():
+            raise CooperativeTaskCancelled()
+
+    def _report_progress(self, value, text) -> None:
+        self._checkpoint()
+        self.progress.emit(value, text)
+        self._checkpoint()
+
+    def _complete(self, *values) -> None:
+        self._checkpoint()
+        self.completed.emit(*values)
+
+
 class ChannelReplacementWorker(CooperativeWorker):
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -5868,6 +5894,7 @@ def compute_external_baseline_reference(
     task_channel_ids: list[int],
     settings: dict,
     progress=None,
+    checkpoint=None,
 ) -> dict:
     """Build robust, length-matched 3/4/5 s resting-baseline references.
 
@@ -5875,6 +5902,8 @@ def compute_external_baseline_reference(
     independent Welch estimate before median aggregation. No artifact-window
     decision is required; non-finite samples remain a numerical safeguard.
     """
+    check = checkpoint or (lambda: None)
+    check()
     meta = source.metadata
     columns = np.asarray(baseline_columns, dtype=np.int64)
     if columns.ndim != 1 or not columns.size:
@@ -5890,9 +5919,11 @@ def compute_external_baseline_reference(
     if meta.rows < int(round(5.0 * fs)):
         raise ValueError("Baseline recording must contain at least one continuous 5 s segment.")
     values = np.asarray(source.read(0, meta.rows, columns), dtype=np.float32)
+    check()
     if values.ndim == 1:
         values = values[:, None]
     if settings.get("analysis_notch") or settings.get("analysis_bandpass"):
+        check()
         mode = "bandpass" if settings.get("analysis_bandpass") else "off"
         values, _ = filter_array(
             values, fs, mode,
@@ -5900,22 +5931,26 @@ def compute_external_baseline_reference(
             float(settings.get("analysis_band_high", 300.0)),
             notch=bool(settings.get("analysis_notch", False)),
         )
+        check()
     if settings.get("smooth"):
         width = max(1, int(round(float(settings.get("smooth_window_sec", 0.02)) * fs)))
         if width > 1:
             kernel = np.ones(width, dtype=np.float32) / width
             values = np.apply_along_axis(lambda item: np.convolve(item, kernel, mode="same"), 0, values)
+            check()
 
     rng = np.random.default_rng(int(settings.get("baseline_random_seed", 20260817)))
     baseline_ids = [int(meta.channel_ids[index]) for index in columns]
     references = {}
     for length_index, length in enumerate(lengths, start=1):
+        check()
         samples = int(round(length * fs))
         starts = _stratified_nonoverlapping_starts(meta.rows, samples, candidate_count, rng)
         target_values, noise_values = [], []
         valid_counts = np.zeros(columns.size, dtype=np.int64)
         rejected = {"nonfinite": np.zeros(columns.size, dtype=np.int64)}
         for segment_index, start in enumerate(starts, start=1):
+            check()
             segment = values[start:start + samples]
             valid = np.all(np.isfinite(segment), axis=0)
             rejected["nonfinite"] += ~valid
@@ -5975,6 +6010,7 @@ def compute_external_baseline_reference(
         valid_counts = np.zeros(columns.size, dtype=np.int64)
         rejected = {"response_missing": np.zeros(columns.size, dtype=np.int64)}
         for segment_index, start in enumerate(starts, start=1):
+            check()
             epoch = values[start:start + epoch_samples]
             finite_response = np.all(np.isfinite(epoch[response_mask]), axis=0)
             finite_baseline = np.all(np.isfinite(epoch[baseline_mask]), axis=0)
@@ -5997,6 +6033,7 @@ def compute_external_baseline_reference(
             "eligible": valid_counts >= minimum_valid,
             "rejected": rejected,
         }
+    check()
     return {
         "channel_ids": baseline_ids,
         "fs": fs,
@@ -6011,7 +6048,7 @@ def compute_external_baseline_reference(
     }
 
 
-class ExternalBaselineWorker(QThread):
+class ExternalBaselineWorker(CancellableAnalysisWorker):
     """Build the task-only external baseline reference without blocking the UI."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -6026,9 +6063,13 @@ class ExternalBaselineWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.completed.emit(compute_external_baseline_reference(
-                self.source, self.baseline_columns, self.task_channel_ids, self.settings, self.progress,
+            self._checkpoint()
+            self._complete(compute_external_baseline_reference(
+                self.source, self.baseline_columns, self.task_channel_ids, self.settings,
+                SimpleNamespace(emit=self._report_progress), checkpoint=self._checkpoint,
             ))
+        except CooperativeTaskCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -6168,7 +6209,7 @@ def compute_external_rest_tf_cluster_test(
     return {**output, "status": "ok", "clusters": entries, "significant_mask": significant_mask, "t_obs": np.asarray(t_obs, dtype=np.float32)}
 
 
-class TaskEpochWorker(QThread):
+class TaskEpochWorker(CancellableAnalysisWorker):
     """Marker-driven Flash/Letter epoch analysis using legacy task parameters."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -6179,6 +6220,7 @@ class TaskEpochWorker(QThread):
 
     def run(self) -> None:
         try:
+            self._checkpoint()
             meta = self.source.metadata
             columns = np.asarray(self.settings.get("columns", np.arange(meta.channels)), dtype=np.int64)
             channel_ids = [int(meta.channel_ids[index]) for index in columns]
@@ -6188,37 +6230,47 @@ class TaskEpochWorker(QThread):
             ))
             data = None
             if requires_full_record:
-                self.progress.emit(1, "任务分析：分析参数要求读取完整记录…")
+                self._report_progress(1, "任务分析：分析参数要求读取完整记录…")
+                self._checkpoint()
                 raw, _ = self.source.materialize(
-                    lambda value, text: self.progress.emit(1 + value * 34, text)
+                    lambda value, text: self._report_progress(1 + value * 34, text)
                 ) if not hasattr(self.source, "data") else (self.source.data, None)
+                self._checkpoint()
                 data = np.asarray(raw[:, columns], dtype=np.float32)
             else:
                 # The normal task path mirrors make_epochs() while avoiding a
                 # multi-gigabyte materialize just to inspect short epochs.
-                self.progress.emit(1, "任务分析：按刺激窗口读取所选通道…")
+                self._report_progress(1, "任务分析：按刺激窗口读取所选通道…")
 
             def read_epoch(first: int, last: int) -> np.ndarray:
+                self._checkpoint()
                 if data is not None:
-                    return np.asarray(data[first:last], dtype=np.float32)
-                return np.asarray(self.source.read(first, last, columns), dtype=np.float32)
+                    epoch = np.asarray(data[first:last], dtype=np.float32)
+                else:
+                    epoch = np.asarray(self.source.read(first, last, columns), dtype=np.float32)
+                self._checkpoint()
+                return epoch
 
             # Apply the legacy analysis-preprocess controls before epoching.
             # These are deliberately separate from preprocessing/LFP filters:
             # users can retain the same loaded data and compare task settings.
             if self.settings.get("analysis_notch") or self.settings.get("analysis_bandpass"):
                 mode = "bandpass" if self.settings.get("analysis_bandpass") else "off"
+                self._checkpoint()
                 data, _ = filter_array(
                     data, meta.fs, mode,
                     float(self.settings.get("analysis_band_low", 0.5)),
                     float(self.settings.get("analysis_band_high", 300.0)),
                     notch=bool(self.settings.get("analysis_notch", False)),
                 )
+                self._checkpoint()
             if self.settings.get("smooth"):
                 width = max(1, int(round(float(self.settings.get("smooth_window_sec", 0.02)) * meta.fs)))
                 if width > 1:
                     kernel = np.ones(width, dtype=np.float32) / width
+                    self._checkpoint()
                     data = np.apply_along_axis(lambda values: np.convolve(values, kernel, mode="same"), 0, data)
+                    self._checkpoint()
             if self.settings.get("zscore"):
                 average = np.nanmean(data, axis=0, keepdims=True)
                 deviation = np.nanstd(data, axis=0, keepdims=True)
@@ -6269,11 +6321,13 @@ class TaskEpochWorker(QThread):
                 reference_ids = [int(channel) for channel in external_baseline_reference.get("channel_ids", [])]
                 reference_lookup = {channel: index for index, channel in enumerate(reference_ids)}
                 for length, reference in (external_baseline_reference.get("references") or {}).items():
+                    self._checkpoint()
                     target = np.full(columns.size, np.nan, dtype=np.float64)
                     noise = np.full(columns.size, np.nan, dtype=np.float64)
                     valid_count = np.zeros(columns.size, dtype=np.int64)
                     eligible = np.zeros(columns.size, dtype=bool)
                     for channel_index, channel_id in enumerate(channel_ids):
+                        self._checkpoint()
                         baseline_index = reference_lookup.get(int(channel_id))
                         if baseline_index is None:
                             continue
@@ -6296,11 +6350,13 @@ class TaskEpochWorker(QThread):
                         external_time_reference = candidate_time_reference
                         external_time_task_indices = task_time_indices
                         for channel_index, channel_id in enumerate(channel_ids):
+                            self._checkpoint()
                             external_time_channel_indices[channel_index] = reference_lookup.get(int(channel_id), -1)
             if lfp_task_metrics and not 0 < target_frequency < meta.fs / 2:
                 raise ValueError("任务目标频率必须介于 0 和奈奎斯特频率之间。")
             skipped = []
             for number, tag in enumerate(requested, start=1):
+                self._checkpoint()
                 candidates = self.markers[self.markers[:, 1] == int(tag)]
                 used_samples = []
                 if self.settings.get("mode") == "Letter":
@@ -6343,6 +6399,7 @@ class TaskEpochWorker(QThread):
                 }
                 external_time_task_trials = []
                 for marker_number, marker in enumerate(candidates[:limit or None], start=1):
+                    self._checkpoint()
                     center = int(marker[0]) - marker_offset
                     first, last = center + start, center + end
                     if first >= 0 and last <= meta.rows:
@@ -6372,6 +6429,7 @@ class TaskEpochWorker(QThread):
                                     tuple(external_baseline_by_length),
                                 )
                                 for length, (run_target, run_noise, run_samples, run_segments) in run_metrics.items():
+                                    self._checkpoint()
                                     baseline_target, baseline_noise, _valid_count, eligible = external_baseline_by_length[length]
                                     matched = (
                                         (run_samples > 0) & eligible
@@ -6440,7 +6498,7 @@ class TaskEpochWorker(QThread):
                             epochs.append(masked_epoch)
                         used_samples.append(int(marker[0])); processed_count += 1
                     if marker_number % 8 == 0:
-                        self.progress.emit(2 + 30 * (number - 1 + marker_number / max(1, len(candidates))) / max(1, len(requested)), f"任务分析：tag {tag}，已读取 {processed_count} 个 trial")
+                        self._report_progress(2 + 30 * (number - 1 + marker_number / max(1, len(candidates))) / max(1, len(requested)), f"任务分析：tag {tag}，已读取 {processed_count} 个 trial")
                 if not processed_count:
                     skipped.append(
                         f"tag {int(tag)}：{len(candidates)} 个 marker 都不在当前数据段的完整 epoch 范围内 "
@@ -6518,6 +6576,7 @@ class TaskEpochWorker(QThread):
                 external_lengths = []
                 external_min_segments = np.zeros(columns.size, dtype=np.int64)
                 for channel in range(columns.size):
+                    self._checkpoint()
                     matched_lengths = [
                         length for length, counts in external_matched_samples_by_length.items() if counts[channel] > 0
                     ]
@@ -6544,17 +6603,20 @@ class TaskEpochWorker(QThread):
                     task_traces = np.asarray(external_time_task_trials, dtype=float)
                     channel_response = {}
                     for channel in range(columns.size):
+                        self._checkpoint()
                         baseline_channel = int(external_time_channel_indices[channel])
                         if baseline_channel < 0 or task_traces.ndim != 3:
                             external_time_status[channel] = "无同通道的静息时域参考"
                             continue
                         task_channel_traces = task_traces[:, :, channel]
                         rest_channel_traces = rest_traces[:, :, baseline_channel]
+                        self._checkpoint()
                         comparison = compute_external_rest_cluster_test(
                             task_channel_traces, rest_channel_traces,
                             permutations=1000, cluster_forming_p=.01,
                             cluster_significance_p=.01, random_seed=20260709 + int(tag) * 100_003 + channel,
                         )
+                        self._checkpoint()
                         valid_task = task_channel_traces[np.all(np.isfinite(task_channel_traces), axis=1)]
                         valid_rest = rest_channel_traces[np.all(np.isfinite(rest_channel_traces), axis=1)]
                         external_time_task_counts[channel] = valid_task.shape[0]
@@ -6662,7 +6724,7 @@ class TaskEpochWorker(QThread):
                     peak_a, peak_b = float(np.nanmax(np.abs(avg_a))), float(np.nanmax(np.abs(avg_b)))
                     item.update(avg_a=avg_a, avg_b=avg_b, diff=avg_b - avg_a, trial_a=trial_a, valid_b=valid_b, corr=corr, peak_a=peak_a, peak_b=peak_b, change=(peak_b - peak_a) / max(abs(peak_a), np.finfo(np.float32).eps) * 100)
                 result.append(item)
-                self.progress.emit(35 + 65 * number / max(1, len(requested)), f"任务分析：tag {tag}，{processed_count} trials")
+                self._report_progress(35 + 65 * number / max(1, len(requested)), f"任务分析：tag {tag}，{processed_count} trials")
             if not result:
                 detail = "\n".join(skipped) or "没有 marker 落在当前数据段中。"
                 raise ValueError(f"没有可用于任务分析的有效 epoch。\n{detail}")
@@ -6682,6 +6744,7 @@ class TaskEpochWorker(QThread):
                 # result's stimtag/nStimTypes selection.
                 behavior_tags = sorted({int(row[1]) for row in self.markers if int(row[1]) in {4, 5, 6, 7}})
                 for behavior_index, tag in enumerate(behavior_tags, start=1):
+                    self._checkpoint()
                     tag = int(tag)
                     tag_markers = self.markers[self.markers[:, 1] == tag]
                     valid_latencies = [
@@ -6695,6 +6758,7 @@ class TaskEpochWorker(QThread):
                     long_start, long_end = int(round(-.5 * meta.fs)), int(round(end_sec * meta.fs))
                     long_epochs, long_samples = [], []
                     for marker in tag_markers[:self.settings["trials_per_stim"] or None]:
+                        self._checkpoint()
                         center = int(marker[0]) - marker_offset
                         first, last = center + long_start, center + long_end
                         if first >= 0 and last <= meta.rows:
@@ -6714,8 +6778,8 @@ class TaskEpochWorker(QThread):
                         "used_marker_samples": long_samples, "trials": len(long_epochs),
                         "end_sec": end_sec, "animal_count": len(valid_latencies),
                     })
-                    self.progress.emit(88 + 12 * behavior_index / max(1, len(behavior_tags)), f"Letter 长行为窗：tag {tag}")
-            self.completed.emit({
+                    self._report_progress(88 + 12 * behavior_index / max(1, len(behavior_tags)), f"Letter 长行为窗：tag {tag}")
+            self._complete({
                 "results": result, "channel_ids": channel_ids, "columns": columns, "fs": float(meta.fs),
                 "aggregate": self.settings["aggregate"], "view_mode": self.settings.get("view_mode", "raw"),
                 "mode": self.settings.get("mode", "Flash"), "lfp_task_metrics": lfp_task_metrics,
@@ -6730,11 +6794,13 @@ class TaskEpochWorker(QThread):
                 )},
                 "behavior_result": behavior_results[0] if behavior_results else None, "behavior_results": behavior_results,
             })
+        except CooperativeTaskCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class TrialVepWorker(QThread):
+class TrialVepWorker(CancellableAnalysisWorker):
     """Extract and baseline-correct every task epoch without five-window QC."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -6749,15 +6815,19 @@ class TrialVepWorker(QThread):
 
     def run(self) -> None:
         try:
+            self._checkpoint()
             meta = self.source.metadata
             channel_lookup = {int(channel): index for index, channel in enumerate(meta.channel_ids)}
             if self.channel_id not in channel_lookup:
                 raise ValueError("所选通道不在当前 LFP 数据源中。")
             processing = dict(self.output_metadata.get("task_processing") or {})
+            self._checkpoint()
             values = np.asarray(self.source.read(0, meta.rows, [channel_lookup[self.channel_id]]), dtype=np.float32)
+            self._checkpoint()
             if values.ndim == 2:
                 values = values[:, 0]
             if processing.get("analysis_notch") or processing.get("analysis_bandpass"):
+                self._checkpoint()
                 filtered, _ = filter_array(
                     values[:, None], meta.fs,
                     "bandpass" if processing.get("analysis_bandpass") else "off",
@@ -6765,11 +6835,14 @@ class TrialVepWorker(QThread):
                     float(processing.get("analysis_band_high", 300.0)),
                     notch=bool(processing.get("analysis_notch")),
                 )
+                self._checkpoint()
                 values = filtered[:, 0]
             if processing.get("smooth"):
                 width = max(1, int(round(float(processing.get("smooth_window_sec", .02)) * meta.fs)))
                 if width > 1:
+                    self._checkpoint()
                     values = np.convolve(values, np.ones(width) / width, mode="same")
+                    self._checkpoint()
             if processing.get("zscore"):
                 deviation = float(np.nanstd(values))
                 values = (values - float(np.nanmean(values))) / (deviation if deviation > 0 else 1.0)
@@ -6789,6 +6862,7 @@ class TrialVepWorker(QThread):
             used_samples = []
             markers = list(self.task_result.get("used_marker_samples") or [])
             for index, marker_sample in enumerate(markers, start=1):
+                self._checkpoint()
                 center = int(marker_sample) - marker_offset
                 first = center + first_offset
                 last = first + epoch_samples
@@ -6802,7 +6876,7 @@ class TrialVepWorker(QThread):
                 trials.append(epoch - correction)
                 used_samples.append(int(marker_sample))
                 if index % 8 == 0:
-                    self.progress.emit(10 + 80 * index / max(1, len(markers)), f"VEP：已读取 {index}/{len(markers)} 个 trial")
+                    self._report_progress(10 + 80 * index / max(1, len(markers)), f"VEP：已读取 {index}/{len(markers)} 个 trial")
             if not trials:
                 raise ValueError("当前 tag 没有落在数据范围内且具有有效刺激前基线的完整 trial。")
             trial_array = np.asarray(trials, dtype=np.float32)
@@ -6811,7 +6885,7 @@ class TrialVepWorker(QThread):
                 mean = np.nanmean(trial_array, axis=0)
                 std = np.nanstd(trial_array, axis=0, ddof=1)
             sem = np.divide(std, np.sqrt(valid_count), out=np.full(epoch_samples, np.nan), where=valid_count > 1)
-            self.completed.emit({
+            self._complete({
                 "tag": int(self.task_result["tag"]), "channel": self.channel_id,
                 "time_ms": t_ms.astype(np.float32), "trials": trial_array,
                 "mean": mean.astype(np.float32), "sem": sem.astype(np.float32),
@@ -6819,11 +6893,13 @@ class TrialVepWorker(QThread):
                 "baseline_start_ms": baseline_start, "baseline_end_ms": baseline_end,
                 "qc_applied": False,
             })
+        except CooperativeTaskCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class ExternalTimeFrequencyWorker(QThread):
+class ExternalTimeFrequencyWorker(CancellableAnalysisWorker):
     """Compute one task/rest power time-frequency comparison."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -6840,6 +6916,7 @@ class ExternalTimeFrequencyWorker(QThread):
 
     def run(self) -> None:
         try:
+            self._checkpoint()
             from scipy import signal
             from mne.time_frequency import tfr_array_morlet
 
@@ -6856,20 +6933,27 @@ class ExternalTimeFrequencyWorker(QThread):
             fs = float(task_meta.fs)
 
             def conditioned(source, column: int) -> np.ndarray:
+                self._checkpoint()
                 values = np.asarray(source.read(0, source.metadata.rows, [column]), dtype=np.float32)
+                self._checkpoint()
                 if values.ndim == 1:
                     values = values[:, None]
                 if self.settings.get("analysis_notch") or self.settings.get("analysis_bandpass"):
+                    self._checkpoint()
                     values, _ = filter_array(
                         values, fs, "bandpass" if self.settings.get("analysis_bandpass") else "off",
                         float(self.settings.get("analysis_band_low", .5)),
                         float(self.settings.get("analysis_band_high", 300.0)),
                         notch=bool(self.settings.get("analysis_notch")),
                     )
+                    self._checkpoint()
                 if self.settings.get("smooth"):
                     width = max(1, int(round(float(self.settings.get("smooth_window_sec", .02)) * fs)))
                     if width > 1:
+                        self._checkpoint()
                         values = np.convolve(values[:, 0], np.ones(width) / width, mode="same")[:, None]
+                        self._checkpoint()
+                self._checkpoint()
                 return values[:, 0]
 
             epoch_start = float(self.settings["epoch_start"])
@@ -6886,13 +6970,14 @@ class ExternalTimeFrequencyWorker(QThread):
             response_mask = (t_ms >= response_start) & (t_ms <= response_end)
             if not np.any(baseline_mask) or not np.any(response_mask):
                 raise ValueError("时频基线窗或对比窗没有采样点。")
-            self.progress.emit(3, "时频图：读取并应用任务分析预处理…")
+            self._report_progress(3, "时频图：读取并应用任务分析预处理…")
             task_values = conditioned(self.task_source, task_lookup[self.channel_id])
             baseline_values = conditioned(self.baseline_source, baseline_lookup[self.channel_id])
             task_offset = int(round(float(task_meta.time_offset) * fs))
             task_epochs = []
             samples = list(self.task_result.get("used_marker_samples") or [])
             for index, sample in enumerate(samples, start=1):
+                self._checkpoint()
                 center = int(sample) - task_offset
                 first = center + int(round(epoch_start * fs / 1000.0))
                 last = first + epoch_samples
@@ -6902,14 +6987,15 @@ class ExternalTimeFrequencyWorker(QThread):
                 if np.all(np.isfinite(epoch[baseline_mask | response_mask])):
                     task_epochs.append(epoch)
                 if index % 4 == 0:
-                    self.progress.emit(5 + 35 * index / max(1, len(samples)), f"时频图：任务 trial {index}/{len(samples)}")
+                    self._report_progress(5 + 35 * index / max(1, len(samples)), f"时频图：任务 trial {index}/{len(samples)}")
             rest_epochs = []
             starts = np.asarray((self.reference.get("time_reference") or {}).get("candidate_starts", []), dtype=np.int64)
             for index, first in enumerate(starts, start=1):
+                self._checkpoint()
                 epoch = baseline_values[int(first):int(first) + epoch_samples]
                 if epoch.size == epoch_samples and np.all(np.isfinite(epoch[baseline_mask | response_mask])):
                     rest_epochs.append(epoch)
-                self.progress.emit(40 + 25 * index / max(1, starts.size), f"时频图：静息伪 epoch {index}/{starts.size}")
+                self._report_progress(40 + 25 * index / max(1, starts.size), f"时频图：静息伪 epoch {index}/{starts.size}")
             if len(task_epochs) < 3 or len(rest_epochs) < 3:
                 raise ValueError(f"有效任务 trial / 静息伪 epoch 为 {len(task_epochs)} / {len(rest_epochs)}，均至少需要 3。")
 
@@ -6918,9 +7004,13 @@ class ExternalTimeFrequencyWorker(QThread):
             output_fs = fs * ratio.numerator / ratio.denominator
 
             def resample(epochs: list[np.ndarray]) -> np.ndarray:
+                self._checkpoint()
                 array = np.asarray(epochs, dtype=np.float32)
                 if ratio.numerator != ratio.denominator:
+                    self._checkpoint()
                     array = signal.resample_poly(array, ratio.numerator, ratio.denominator, axis=1).astype(np.float32)
+                    self._checkpoint()
+                self._checkpoint()
                 return array
 
             task_array, rest_array = resample(task_epochs), resample(rest_epochs)
@@ -6938,19 +7028,25 @@ class ExternalTimeFrequencyWorker(QThread):
                 raise ValueError("刺激前基线窗过短，无法支持当前最低频率和小波周期数。")
 
             def normalized_power(array: np.ndarray, label: str) -> np.ndarray:
-                self.progress.emit(68 if label == "任务" else 80, f"时频图：计算{label}小波功率…")
+                self._checkpoint()
+                self._report_progress(68 if label == "任务" else 80, f"时频图：计算{label}小波功率…")
+                self._checkpoint()
                 power = tfr_array_morlet(
                     array[:, None, :], sfreq=output_fs, freqs=frequencies, n_cycles=cycles,
                     output="power", zero_mean=True, n_jobs=1, verbose=False,
                 )[:, 0]
+                self._checkpoint()
                 reference_power = np.nanmean(power[:, :, output_baseline], axis=2, keepdims=True)
+                self._checkpoint()
                 return (10.0 * np.log10(np.maximum(power, np.finfo(float).tiny) / np.maximum(reference_power, np.finfo(float).tiny)))[:, :, output_response]
 
             task_maps = normalized_power(task_array, "任务")
             rest_maps = normalized_power(rest_array, "静息")
+            self._checkpoint()
             comparison = compute_external_rest_tf_cluster_test(task_maps, rest_maps)
+            self._checkpoint()
             response_time_ms = output_t_ms[output_response]
-            self.completed.emit({
+            self._complete({
                 "tag": int(self.task_result["tag"]), "channel": self.channel_id,
                 "frequencies_hz": frequencies.astype(np.float32), "time_ms": response_time_ms.astype(np.float32),
                 "task_mean_db": np.nanmean(task_maps, axis=0).astype(np.float32),
@@ -6958,11 +7054,13 @@ class ExternalTimeFrequencyWorker(QThread):
                 "task_minus_rest_db": (np.nanmean(task_maps, axis=0) - np.nanmean(rest_maps, axis=0)).astype(np.float32),
                 "comparison": comparison, "sample_rate_hz": output_fs, "cycles": cycles,
             })
+        except CooperativeTaskCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class ItpcWorker(QThread):
+class ItpcWorker(CancellableAnalysisWorker):
     """Stream marker-aligned Morlet phases directly from complete epochs."""
     progress = pyqtSignal(float, str)
     completed = pyqtSignal(object)
@@ -6976,6 +7074,7 @@ class ItpcWorker(QThread):
 
     def run(self) -> None:
         try:
+            self._checkpoint()
             from scipy import signal
 
             meta = self.source.metadata
@@ -7003,20 +7102,29 @@ class ItpcWorker(QThread):
             processing = dict(self.task_context.get("task_processing") or {})
             data = None
             if any((processing.get("analysis_notch"), processing.get("analysis_bandpass"), processing.get("smooth"), processing.get("zscore"))):
-                raw, _ = self.source.materialize() if not hasattr(self.source, "data") else (self.source.data, None)
+                self._checkpoint()
+                raw, _ = self.source.materialize(
+                    lambda value, text: self._report_progress(value * .2, text)
+                ) if not hasattr(self.source, "data") else (self.source.data, None)
+                self._checkpoint()
                 data = np.asarray(raw[:, columns], dtype=np.float32)
                 if processing.get("analysis_notch") or processing.get("analysis_bandpass"):
+                    self._checkpoint()
                     data, _ = filter_array(data, meta.fs, "bandpass" if processing.get("analysis_bandpass") else "off", float(processing.get("analysis_band_low", .5)), float(processing.get("analysis_band_high", 300.0)), notch=bool(processing.get("analysis_notch")))
+                    self._checkpoint()
                 if processing.get("smooth"):
                     width = max(1, int(round(float(processing.get("smooth_window_sec", .02)) * meta.fs)))
                     if width > 1:
                         kernel = np.ones(width, dtype=np.float32) / width
+                        self._checkpoint()
                         data = np.apply_along_axis(lambda values: np.convolve(values, kernel, mode="same"), 0, data)
+                        self._checkpoint()
                 if processing.get("zscore"):
                     deviation = np.nanstd(data, axis=0, keepdims=True); deviation[deviation == 0] = 1.0
                     data = (data - np.nanmean(data, axis=0, keepdims=True)) / deviation
             by_tag: dict[int, list[int]] = {}
             for sample, tag in markers:
+                self._checkpoint()
                 by_tag.setdefault(int(tag), []).append(int(sample))
             limit = max(0, int(self.task_context.get("trial_limit", 0)))
             by_tag = {
@@ -7035,23 +7143,32 @@ class ItpcWorker(QThread):
             total = sum(len(by_tag[tag]) for tag in tags) * frequencies.size
             done = 0
             for tag in tags:
+                self._checkpoint()
                 phase_sum = np.zeros((frequencies.size, t_ms.size, columns.size), dtype=np.complex64)
                 counts = np.zeros((frequencies.size, t_ms.size, columns.size), dtype=np.int32)
                 for sample in by_tag[tag]:
+                    self._checkpoint()
                     center = sample - marker_offset
+                    self._checkpoint()
                     epoch = np.asarray(data[center + first:center + last] if data is not None else self.source.read(center + first, center + last, columns), dtype=np.float32)
+                    self._checkpoint()
                     if epoch.ndim == 1:
                         epoch = epoch[:, None]
                     if ratio.numerator != ratio.denominator:
+                        self._checkpoint()
                         epoch = signal.resample_poly(epoch, ratio.numerator, ratio.denominator, axis=0).astype(np.float32, copy=False)
+                        self._checkpoint()
                     if epoch.shape[0] != output_samples:
                         epoch = epoch[:output_samples]
                     for freq_index, frequency in enumerate(frequencies):
+                        self._checkpoint()
                         support_ms = self.settings["cycles"] / (2.0 * frequency) * 1000.0
                         half_width = max(2, int(np.ceil(support_ms / 1000.0 * work_fs)))
                         wave_t = np.arange(-half_width, half_width + 1, dtype=float) / work_fs
                         wavelet = np.exp(2j * np.pi * frequency * wave_t) * np.exp(-wave_t ** 2 / (2.0 * (self.settings["cycles"] / (2.0 * np.pi * frequency)) ** 2))
+                        self._checkpoint()
                         coefficients = signal.fftconvolve(epoch, wavelet[:, None], mode="same", axes=0)
+                        self._checkpoint()
                         # Only the natural epoch edges limit wavelet support;
                         # there are no artificial one-second QC boundaries.
                         valid_time = (t_ms >= epoch_start + support_ms) & (t_ms < epoch_end - support_ms)
@@ -7062,13 +7179,15 @@ class ItpcWorker(QThread):
                         phase_sum[freq_index, valid_time] += np.where(finite, unit_phase, 0.0)
                         counts[freq_index, valid_time] += finite
                         done += 1
-                        self.progress.emit(100.0 * done / max(1, total), f"ITPC：tag {tag}，trial {sample}，{frequency:g} Hz")
+                        self._report_progress(100.0 * done / max(1, total), f"ITPC：tag {tag}，trial {sample}，{frequency:g} Hz")
                 itpc = np.abs(phase_sum) / np.maximum(counts, 1)
                 itpc[counts < int(self.settings["min_trials"])] = np.nan
                 baseline_mask = (t_ms >= self.settings["baseline_start"]) & (t_ms <= self.settings["baseline_end"])
                 baseline = np.nanmean(itpc[:, baseline_mask, :], axis=1, keepdims=True) if np.any(baseline_mask) else np.full((frequencies.size, 1, columns.size), np.nan)
                 results.append({"tag": tag, "itpc": itpc.astype(np.float32), "itpc_baseline_delta": (itpc - baseline).astype(np.float32), "counts": counts, "trials": len(by_tag[tag])})
-            self.completed.emit({"results": results, "frequencies_hz": frequencies, "t_ms": t_ms, "channel_ids": channel_ids, "sample_rate": work_fs, "cycles": self.settings["cycles"], "min_trials": self.settings["min_trials"], "baseline_start": self.settings["baseline_start"], "baseline_end": self.settings["baseline_end"]})
+            self._complete({"results": results, "frequencies_hz": frequencies, "t_ms": t_ms, "channel_ids": channel_ids, "sample_rate": work_fs, "cycles": self.settings["cycles"], "min_trials": self.settings["min_trials"], "baseline_start": self.settings["baseline_start"], "baseline_end": self.settings["baseline_end"]})
+        except CooperativeTaskCancelled:
+            self.cancelled.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -9045,6 +9164,14 @@ class QtAnalysisGUI(QMainWindow):
         run_status_layout.setSpacing(7)
         run_status_layout.addWidget(QLabel("运行状态"))
         run_status_layout.addWidget(self.lfp_progress, 1)
+        self.lfp_cancel_button = QPushButton("取消")
+        self.lfp_cancel_button.setMinimumWidth(90)
+        self.lfp_cancel_button.setMinimumHeight(32)
+        self.lfp_cancel_button.setEnabled(False)
+        self.lfp_cancel_button.setToolTip("取消正在运行的 Letter、VEP、ITPC、baseline、时频或峰谷测试；等待当前计算段安全结束，不强制杀线程。")
+        self.lfp_cancel_button.clicked.connect(self.cancel_lfp_operations)
+        self._lfp_cancellable_operations = {}
+        run_status_layout.addWidget(self.lfp_cancel_button)
         run_status_layout.addWidget(self.lfp_status, 2)
         layout.addWidget(run_status)
 
@@ -9088,6 +9215,10 @@ class QtAnalysisGUI(QMainWindow):
         self.alignment_log_edit = QLineEdit()
         self.alignment_event_edit = QLineEdit()
         self.alignment_detection_edit = QLineEdit()
+        self._alignment_autofill_context = None
+        self._alignment_autofill_values = {}
+        self._alignment_manual_inputs = set()
+        self._alignment_autofill_result = None
         for name, label, callback in (
             ("alignment_log_edit", "log.txt", self.choose_alignment_log),
             ("alignment_event_edit", "Event CSV", self.choose_alignment_events),
@@ -9098,6 +9229,19 @@ class QtAnalysisGUI(QMainWindow):
             button = QPushButton("浏览…"); button.clicked.connect(callback); row.addWidget(button)
             holder = QWidget(); holder.setLayout(row)
             form.addRow(label, holder)
+        for kind, edit in (("log", self.alignment_log_edit), ("events", self.alignment_event_edit),
+                           ("detection", self.alignment_detection_edit)):
+            edit.textEdited.connect(lambda _text, key=kind: self._mark_alignment_input_manual(key))
+        autofill_row = QHBoxLayout()
+        self.alignment_autofill_status = QLabel("载入 H5 后自动匹配 log、8～10 KB 的 Letter CSV 和视频检测 TXT；浏览可手动替换。")
+        self.alignment_autofill_status.setWordWrap(True)
+        self.alignment_autofill_button = QPushButton("重新自动匹配")
+        self.alignment_autofill_button.setToolTip("仅重试当前 H5 的未手动修改项；不覆盖手动路径，不执行时间对齐。")
+        self.alignment_autofill_button.clicked.connect(self._retry_alignment_autofill)
+        autofill_row.addWidget(self.alignment_autofill_status, 1)
+        autofill_row.addWidget(self.alignment_autofill_button)
+        autofill_holder = QWidget(); autofill_holder.setLayout(autofill_row)
+        form.addRow(autofill_holder)
         self.alignment_task_mode_var = QComboBox()
         self.alignment_task_mode_var.addItems(["Flash", "Letter"])
         self.alignment_task_mode_var.setCurrentText("Letter")
@@ -9822,15 +9966,102 @@ class QtAnalysisGUI(QMainWindow):
         layout.addStretch(1)
         return page
 
+    def _alignment_input_edits(self) -> dict:
+        return {"log": self.alignment_log_edit, "events": self.alignment_event_edit,
+                "detection": self.alignment_detection_edit}
+
+    def _mark_alignment_input_manual(self, kind: str) -> None:
+        self._alignment_manual_inputs.add(kind)
+        self._show_alignment_autofill_status()
+        self._update_file_banners()
+
+    def _set_manual_alignment_input(self, kind: str, filename: str) -> None:
+        self._alignment_input_edits()[kind].setText(filename)
+        self._mark_alignment_input_manual(kind)
+
+    def _show_alignment_autofill_status(self) -> None:
+        result = self._alignment_autofill_result
+        if result is None:
+            return
+        descriptions, details = [], []
+        labels = {"log": "log", "events": "CSV", "detection": "视频检测"}
+        for kind, edit in self._alignment_input_edits().items():
+            item = result["files"][kind]
+            if kind in self._alignment_manual_inputs:
+                description = "手动指定" if edit.text().strip() else "手动留空"
+                message = "保留手动设置；重新自动匹配不会覆盖。"
+            else:
+                description = {"found": "已自动填入", "ambiguous": "多个候选，需浏览", "missing": "未找到",
+                               "unavailable": "目录不可用", "unrecognized": "文件名无法识别"}[item["status"]]
+                message = item["message"]
+            descriptions.append(f"{labels[kind]}：{description}")
+            detail = f"{labels[kind]}：{message}"
+            if kind in result["directories"]:
+                detail += f"\n搜索目录：{result['directories'][kind]}"
+            if item["candidates"]:
+                detail += "\n候选：\n" + "\n".join(str(path) for path in item["candidates"])
+            details.append(detail)
+            edit.setToolTip(detail)
+        self.alignment_autofill_status.setText("自动匹配｜" + " ｜ ".join(descriptions))
+        self.alignment_autofill_status.setToolTip("\n\n".join(details))
+
+    def _autofill_alignment_inputs(self, filename: Path) -> None:
+        """Only fill companion paths, without parsing data or running alignment."""
+        from alignment_autofill import discover_alignment_files
+        if not hasattr(self, "alignment_autofill_status"):
+            return
+        filename = Path(filename)
+        context = os.path.normcase(str(filename.resolve()))
+        edits = self._alignment_input_edits()
+        if context != self._alignment_autofill_context:
+            # Even manual inputs belong to the previous recording, not a new H5.
+            self._alignment_manual_inputs.clear()
+            self._alignment_autofill_values.clear()
+            for edit in edits.values():
+                edit.clear()
+        else:
+            # Also respect programmatic/manual text changes that did not emit
+            # textEdited, including another UI adapter's setText call.
+            for kind, edit in edits.items():
+                if edit.text() != self._alignment_autofill_values.get(kind, ""):
+                    self._alignment_manual_inputs.add(kind)
+        self._alignment_autofill_context = context
+        self._alignment_autofill_h5_path = filename
+        try:
+            result = discover_alignment_files(filename, getattr(self, "_alignment_autofill_root", None))
+        except Exception as exc:
+            # Companion lookup is optional: an inaccessible directory must
+            # never turn a successful H5 import into a "load failed" error.
+            result = {"identity": None, "directories": {}, "files": {
+                kind: {"selected": None, "candidates": [], "status": "unavailable",
+                       "message": f"自动匹配失败，请浏览手动选择：{exc}"} for kind in edits
+            }}
+        self._alignment_autofill_result = result
+        for kind, edit in edits.items():
+            if kind not in self._alignment_manual_inputs:
+                selected = result["files"][kind]["selected"]
+                value = selected.as_posix() if selected is not None else ""
+                edit.setText(value)
+                self._alignment_autofill_values[kind] = value
+        self._show_alignment_autofill_status()
+        self._update_file_banners()
+
+    def _retry_alignment_autofill(self) -> None:
+        filename = getattr(self, "_alignment_autofill_h5_path", None)
+        if filename is not None:
+            self._autofill_alignment_inputs(filename)
+        else:
+            self.alignment_autofill_status.setText("请先载入一个 H5，再自动匹配对齐文件。")
+
     def choose_alignment_log(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "选择实验 log.txt", str(Path.cwd()), "Text files (*.txt);;All files (*.*)")
         if filename:
-            self.alignment_log_edit.setText(filename)
+            self._set_manual_alignment_input("log", filename)
 
     def choose_alignment_events(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "选择 Flash Event CSV", str(Path.cwd()), "CSV files (*.csv);;All files (*.*)")
         if filename:
-            self.alignment_event_edit.setText(filename)
+            self._set_manual_alignment_input("events", filename)
 
     def choose_alignment_detection(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -9838,7 +10069,7 @@ class QtAnalysisGUI(QMainWindow):
             "Detection results (*.txt);;Text files (*.txt);;All files (*.*)",
         )
         if filename:
-            self.alignment_detection_edit.setText(filename)
+            self._set_manual_alignment_input("detection", filename)
 
     def _alignment_healthy_channel_ids(self, source) -> set[int]:
         """Allow only channels confirmed healthy by the latest completed QC."""
@@ -10316,6 +10547,97 @@ class QtAnalysisGUI(QMainWindow):
         self._lfp_worker = worker
         worker.start()
 
+    def _track_lfp_operation(self, worker, label: str, restore=None, cancel_notify=None) -> None:
+        """Register all jobs sharing the LFP progress row, including test dialogs."""
+        operations = self._lfp_cancellable_operations
+        if id(worker) in operations:
+            return
+        operations[id(worker)] = {"worker": worker, "label": label, "restore": restore,
+                                  "cancel_notify": cancel_notify, "cancel_requested": False,
+                                  "settled": False, "cancel_reported": False}
+        worker.progress.connect(lambda value, text: self._lfp_operation_progress(worker, value, text))
+        worker.cancelled.connect(lambda *_: self._lfp_operation_cancelled(worker))
+        worker.finished.connect(lambda: self._lfp_operation_finished(worker))
+        self._refresh_lfp_cancel_button()
+
+    def _connect_lfp_operation(self, worker, label, completed, failed, restore=None) -> None:
+        self._track_lfp_operation(worker, label, restore)
+        worker.completed.connect(lambda *values: self._deliver_lfp_completion(worker, completed, *values))
+        worker.failed.connect(lambda error: self._deliver_lfp_failure(worker, failed, error))
+
+    def _lfp_operation_progress(self, worker, value, text) -> None:
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if entry and not entry["cancel_requested"]:
+            self._update_lfp_progress(value, text)
+
+    def _mark_lfp_cancel_requested(self, worker) -> None:
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if entry and not entry["settled"]:
+            entry["cancel_requested"] = True
+            worker._ui_cancel_requested = True
+        self._refresh_lfp_cancel_button()
+
+    def _refresh_lfp_cancel_button(self) -> None:
+        entries = [entry for entry in self._lfp_cancellable_operations.values() if not entry["settled"]]
+        waiting = any(entry["cancel_requested"] for entry in entries)
+        self.lfp_cancel_button.setText("取消中…" if waiting else "取消")
+        self.lfp_cancel_button.setEnabled(any(not entry["cancel_requested"] for entry in entries))
+
+    def cancel_lfp_operations(self) -> None:
+        entries = [entry for entry in self._lfp_cancellable_operations.values() if not entry["settled"]]
+        if not entries:
+            return
+        self._lfp_cancel_generation = getattr(self, "_lfp_cancel_generation", 0) + 1
+        self._resume_external_time_frequency_after_baseline = False
+        for entry in entries:
+            worker = entry["worker"]
+            self._mark_lfp_cancel_requested(worker)
+            if callable(getattr(worker, "cancel", None)):
+                worker.cancel()
+            else:
+                worker.requestInterruption()
+            if entry["cancel_notify"]:
+                entry["cancel_notify"]()
+        self.lfp_status.setText("正在取消：" + "、".join(entry["label"] for entry in entries)
+                                + "；等待当前计算段安全结束，不会继续后续步骤。")
+
+    def _lfp_operation_cancelled(self, worker) -> None:
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if entry and not entry["cancel_reported"]:
+            entry["cancel_reported"] = True
+            entry["cancel_requested"] = True
+            self._resume_external_time_frequency_after_baseline = False
+            self.lfp_progress.setValue(0)
+            self.lfp_status.setText(f"{entry['label']}已取消；未完成结果不写入，原数据及已完成结果保留。")
+
+    def _deliver_lfp_completion(self, worker, callback, *values) -> None:
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if getattr(worker, "_ui_cancel_requested", False):
+            self._lfp_operation_cancelled(worker)
+            return
+        if entry:
+            entry["settled"] = True
+        callback(*values)
+
+    def _deliver_lfp_failure(self, worker, callback, error) -> None:
+        if getattr(worker, "_ui_cancel_requested", False):
+            self._lfp_operation_cancelled(worker)
+            return
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if entry:
+            entry["settled"] = True
+        callback(error)
+
+    def _lfp_operation_finished(self, worker) -> None:
+        entry = self._lfp_cancellable_operations.get(id(worker))
+        if entry:
+            if entry["cancel_requested"]:
+                self._lfp_operation_cancelled(worker)
+            self._lfp_cancellable_operations.pop(id(worker), None)
+            if entry["restore"]:
+                entry["restore"]()
+        self._refresh_lfp_cancel_button()
+
     def _update_lfp_progress(self, value: float, message: str) -> None:
         self.lfp_progress.setValue(max(0, min(100, int(round(value)))))
         self.lfp_status.setText(message)
@@ -10626,6 +10948,8 @@ class QtAnalysisGUI(QMainWindow):
                         "数据状态：已加载 LFP H5；已同步该文件中保存的通道选择、完成状态和分析参数。 "
                         + self._format_lfp_analysis_state(self._loaded_lfp_analysis_state)
                     )
+                if len(filenames) == 1:
+                    self._autofill_alignment_inputs(Path(filenames[0]))
             else:
                 self.spike_source = source
                 restored_spike_state = (
@@ -11192,11 +11516,12 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "baseline 参数无效", str(exc))
             return False
         worker = ExternalBaselineWorker(baseline, baseline_columns, task_channel_ids, settings)
-        worker.progress.connect(lambda value, text: self._update_lfp_progress(value, text))
-        worker.completed.connect(
-            lambda reference, task_signature=signature: self._finish_external_baseline_reference(reference, task_signature)
+        self._connect_lfp_operation(
+            worker, "baseline 参考",
+            lambda reference: self._finish_external_baseline_reference(reference, signature),
+            self._fail_external_baseline_reference,
+            restore=lambda: self.external_baseline_prepare_button.setEnabled(True),
         )
-        worker.failed.connect(lambda error: self._fail_external_baseline_reference(error))
         self._external_baseline_worker = worker
         self.external_baseline_prepare_button.setEnabled(False)
         self._update_lfp_progress(0, "正在准备实验前 baseline 的 3/4/5 s 参考…")
@@ -11220,7 +11545,9 @@ class QtAnalysisGUI(QMainWindow):
         self._update_lfp_progress(100, "实验前 baseline 参考已准备；运行 Letter 任务分析后将自动按连续 3/4/5 s 配对。")
         if getattr(self, "_resume_external_time_frequency_after_baseline", False):
             self._resume_external_time_frequency_after_baseline = False
-            QTimer.singleShot(0, self.run_external_time_frequency)
+            generation = getattr(self, "_lfp_cancel_generation", 0)
+            QTimer.singleShot(0, lambda: self.run_external_time_frequency()
+                              if generation == getattr(self, "_lfp_cancel_generation", 0) else None)
 
     def _render_external_baseline_qc_details(self, reference: dict) -> None:
         """Show numerical availability without artifact-window rejection columns."""
@@ -11393,9 +11720,11 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "时频参数无效", str(exc))
             return
         worker = ExternalTimeFrequencyWorker(task_source, baseline_source, reference, task_result, int(channel), settings)
-        worker.progress.connect(self._update_lfp_progress)
-        worker.completed.connect(self._finish_external_time_frequency)
-        worker.failed.connect(self._fail_external_time_frequency)
+        self._connect_lfp_operation(
+            worker, "任务-静息时频", self._finish_external_time_frequency,
+            self._fail_external_time_frequency,
+            restore=lambda: self.external_time_frequency_button.setEnabled(True),
+        )
         self._external_time_frequency_worker = worker
         self.external_time_frequency_button.setEnabled(False)
         self._update_lfp_progress(0, "正在计算任务-静息时频图…")
@@ -11415,6 +11744,8 @@ class QtAnalysisGUI(QMainWindow):
         if existing is not None:
             try:
                 if existing.isVisible():
+                    if existing.isMinimized():
+                        existing.showNormal()
                     existing.raise_(); existing.activateWindow(); return
             except RuntimeError:
                 pass
@@ -11433,7 +11764,7 @@ class QtAnalysisGUI(QMainWindow):
                 "channel_ids": selected_ids, "tags": tags,
                 "epoch_start_ms": get("epoch_start_ms_var", -500), "epoch_end_ms": get("epoch_end_ms_var", 6000),
                 "baseline_start_ms": get("baseline_start_ms_var", -200), "baseline_end_ms": get("baseline_end_ms_var", 0),
-                "trial_limit": max(0, int(get("trials_per_stim_var", 0)), int(get("compare_trial_a_var", 0)), int(get("compare_trial_b_var", 0))),
+                "trial_limit": 0,  # Experimental peak test defaults to every trial, independently of Letter A/B.
                 "processing": {
                     "analysis_notch": self.analysis_notch_var.isChecked(), "analysis_bandpass": self.analysis_bandpass_var.isChecked(),
                     "analysis_band_low": get("analysis_band_low_var", .5), "analysis_band_high": get("analysis_band_high_var", 300),
@@ -11469,9 +11800,10 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.warning(self, "VEP 参数无效", str(exc))
             return
         worker = TrialVepWorker(source, task_result, int(channel), output)
-        worker.progress.connect(self._update_lfp_progress)
-        worker.completed.connect(self._finish_trial_vep)
-        worker.failed.connect(self._fail_trial_vep)
+        self._connect_lfp_operation(
+            worker, "Trial VEP", self._finish_trial_vep, self._fail_trial_vep,
+            restore=lambda: self.lfp_trial_vep_button.setEnabled(True),
+        )
         self._trial_vep_worker = worker
         self.lfp_trial_vep_button.setEnabled(False)
         self._update_lfp_progress(0, "正在提取未经过五窗 QC 切割的 Trial-trial VEP…")
@@ -11756,9 +12088,17 @@ class QtAnalysisGUI(QMainWindow):
             QMessageBox.information(self, "任务正在运行", "当前任务仍在读取或分析数据，请等待完成。")
             return
         worker = TaskEpochWorker(source, markers, settings)
-        worker.progress.connect(lambda value, text: self._update_task_progress(stage, value, text))
-        worker.completed.connect(lambda output, kind=stage, name=mode: self._finish_task_epoch_analysis(kind, name, output))
-        worker.failed.connect(lambda error, kind=stage: self._fail_task_epoch_analysis(kind, error))
+        if stage == "lfp":
+            self._connect_lfp_operation(
+                worker, f"{mode} 任务分析",
+                lambda output: self._finish_task_epoch_analysis(stage, mode, output),
+                lambda error: self._fail_task_epoch_analysis(stage, error),
+                restore=lambda: self._set_task_buttons_enabled(stage, True),
+            )
+        else:
+            worker.progress.connect(lambda value, text: self._update_task_progress(stage, value, text))
+            worker.completed.connect(lambda output: self._finish_task_epoch_analysis(stage, mode, output))
+            worker.failed.connect(lambda error: self._fail_task_epoch_analysis(stage, error))
         if stage == "lfp": self._lfp_task_worker = worker
         else: self._spike_task_worker = worker
         self._set_task_buttons_enabled(stage, False)
@@ -11851,9 +12191,7 @@ class QtAnalysisGUI(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "ITPC 参数无效", str(exc)); return
         worker = ItpcWorker(source, context, settings)
-        worker.progress.connect(lambda value, text: self._update_lfp_progress(value, text))
-        worker.completed.connect(self._finish_lfp_itpc)
-        worker.failed.connect(self._fail_lfp_itpc)
+        self._connect_lfp_operation(worker, "ITPC", self._finish_lfp_itpc, self._fail_lfp_itpc)
         self._lfp_itpc_worker = worker
         self.lfp_status.setText("正在计算 marker 对齐 ITPC…")
         worker.start()
@@ -17924,6 +18262,7 @@ class QtAnalysisGUI(QMainWindow):
                     allowed_channel_ids=self.good_channel_ids if restored_preprocess_qc else (),
                 )
             self.statusBar().showMessage("已加载 HDF5 元数据；预览仅按当前时间窗/通道切片读取。")
+            self._autofill_alignment_inputs(filename)
             self._update_file_banners()
             self._update_one_click_plan_summary()
         except Exception as exc:
@@ -18126,6 +18465,9 @@ class QtAnalysisGUI(QMainWindow):
         for worker, _label in getattr(self, "_shared_preprocess_tasks", []):
             if isinstance(worker, QThread):
                 workers[id(worker)] = worker
+        for entry in getattr(self, "_lfp_cancellable_operations", {}).values():
+            worker = entry["worker"]
+            workers[id(worker)] = worker
         running = [worker for worker in workers.values() if is_running(worker)]
         for worker in running:
             if hasattr(worker, "set_paused"):

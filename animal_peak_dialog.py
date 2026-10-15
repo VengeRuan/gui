@@ -10,6 +10,11 @@ try:
 except ImportError:
     from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
+from matplotlib import rc_context
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+
+from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
 
 from animal_peak_analysis import (
     AnalysisCancelled, analyze_animal_peaks, export_animal_peak_results, trial_detail_trace,
@@ -21,25 +26,37 @@ class AnimalPeakWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(float, str)
     completed = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
-    cancelled = QtCore.pyqtSignal()
+    cancelled = QtCore.pyqtSignal(str)
 
     def __init__(self, source, markers, matches, settings, parent=None, export=None):
         super().__init__(parent)
         self.source, self.markers, self.matches, self.settings = source, markers, matches, settings
         self.export = export
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+        self.requestInterruption()
+
+    def _is_cancelled(self):
+        return self._cancel_requested or self.isInterruptionRequested()
 
     def run(self):
         try:
+            if self._is_cancelled():
+                raise AnalysisCancelled("已取消测试操作")
             if self.export is None:
                 value = analyze_animal_peaks(self.source, self.markers, self.matches, self.settings,
-                                            self.progress.emit, self.isInterruptionRequested)
+                                            self.progress.emit, self._is_cancelled)
             else:
                 output, directory, individual = self.export
                 value = export_animal_peak_results(output, self.source, directory, individual,
-                                                  self.progress.emit, self.isInterruptionRequested)
+                                                  self.progress.emit, self._is_cancelled)
+            if self._is_cancelled():
+                raise AnalysisCancelled("已取消测试操作")
             self.completed.emit(value)
-        except AnalysisCancelled:
-            self.cancelled.emit()
+        except AnalysisCancelled as exc:
+            self.cancelled.emit(str(exc))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -47,8 +64,18 @@ class AnimalPeakWorker(QtCore.QThread):
 class AnimalPeakDialog(QtWidgets.QDialog):
     def __init__(self, parent, source, markers, matches, defaults):
         super().__init__(parent)
-        self.setWindowTitle("测试：AnimalStart 前最大峰 / 最小谷对齐平均")
+        self.setWindowTitle("测试：AnimalStart 前后最大峰 / 最小谷对齐平均")
+        flags = QtCore.Qt.WindowType if hasattr(QtCore.Qt, "WindowType") else QtCore.Qt
+        self.setWindowFlags(flags.Window | flags.WindowTitleHint | flags.WindowSystemMenuHint
+                            | flags.WindowMinimizeButtonHint | flags.WindowMaximizeButtonHint
+                            | flags.WindowCloseButtonHint)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(800, 600)
         self.resize(1300, 900)
+        screen = self.screen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            self.resize(min(1300, max(800, area.width() - 40)), min(900, max(600, area.height() - 60)))
         self.source = source
         self.markers = np.asarray(markers).copy()
         self.matches = {int(key): dict(value) for key, value in matches.items()}
@@ -62,12 +89,19 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._detail_conditioned = None
         self._detail_conditioned_channel = None
         layout = QtWidgets.QVBoxLayout(self)
+        self.parameter_toggle = QtWidgets.QPushButton("收起参数区，扩大绘图区")
+        self.parameter_toggle.setCheckable(True); self.parameter_toggle.setChecked(True)
+        self.parameter_toggle.setMaximumWidth(230)
+        layout.addWidget(self.parameter_toggle)
+        parameter_panel = QtWidgets.QWidget()
+        parameter_layout = QtWidgets.QVBoxLayout(parameter_panel)
+        parameter_layout.setContentsMargins(0, 0, 0, 0)
         intro = QtWidgets.QLabel(
             "测试功能，与原 Letter/SNR 计算独立。每个有效 trial 同时取搜索区最大值和最小值；"
             "不按相似度筛选、不反转负谷、不归一化幅值。没有有效 AnimalStart 的 trial 不生成子图。"
             "强制极值对齐的平均峰不能单独证明存在稳定 VEP。"
         )
-        intro.setWordWrap(True); layout.addWidget(intro)
+        intro.setWordWrap(True); parameter_layout.addWidget(intro)
         metadata = source.metadata
         source_label = QtWidgets.QLabel(
             f"数据：{Path(metadata.path).name} | {metadata.fs:g} Hz | 当前已选 {len(defaults['channel_ids'])} 通道\n"
@@ -75,10 +109,12 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             f"基线 {defaults['baseline_start_ms']:g}～{defaults['baseline_end_ms']:g} ms（相对 Letter）。"
             "截取片段可跨 AnimalStart，并可按需读取旧 Epoch 外仍存在的源数据。"
         )
-        source_label.setWordWrap(True); layout.addWidget(source_label)
+        source_label.setWordWrap(True); parameter_layout.addWidget(source_label)
         self.parameter_box = QtWidgets.QGroupBox("测试参数（不回写原任务参数）")
         form = QtWidgets.QGridLayout(self.parameter_box)
         self.search_spin = self._spin(300, .1, 60000)
+        self.search_after_spin = self._spin(float(defaults.get("search_after_ms", 0)), 0, 60000)
+        self.search_after_spin.setToolTip("将找最大峰/最小谷的范围扩展到 AnimalStart 之后；0 表示只搜索之前。不是特征点后的截取长度。")
         self.pre_spin = self._spin(50, 0, 60000)
         self.post_spin = self._spin(50, 0, 60000)
         self.channel_edit = QtWidgets.QLineEdit()
@@ -87,27 +123,39 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.tag_edit.setPlaceholderText("留空=全部 Letter Tag 4/5/6/7")
         self.limit_spin = QtWidgets.QSpinBox(); self.limit_spin.setRange(0, 1000000)
         self.limit_spin.setMaximumWidth(145)
-        self.limit_spin.setValue(int(defaults.get("trial_limit", 0)))
+        self.limit_spin.setValue(0)
         self.limit_spin.setSpecialValueText("全部")
+        self.limit_spin.setToolTip("测试默认使用全部 Trial，不继承 Letter 的每刺激 Trial 和对比 A/B 上限；可手动设置正整数。")
         for column, (label, widget) in enumerate((("AnimalStart 前搜索 ms", self.search_spin),
+                                                ("AnimalStart 后搜索 ms", self.search_after_spin),
                                                 ("特征点前截取 ms", self.pre_spin), ("特征点后截取 ms", self.post_spin))):
             form.addWidget(QtWidgets.QLabel(label), 0, column*2); form.addWidget(widget, 0, column*2+1)
         form.addWidget(QtWidgets.QLabel("实际通道号"), 1, 0); form.addWidget(self.channel_edit, 1, 1, 1, 3)
-        form.addWidget(QtWidgets.QLabel("Tag"), 1, 4); form.addWidget(self.tag_edit, 1, 5)
+        form.addWidget(QtWidgets.QLabel("Tag"), 1, 4); form.addWidget(self.tag_edit, 1, 5, 1, 3)
         form.addWidget(QtWidgets.QLabel("每 Tag Trial 上限"), 2, 0); form.addWidget(self.limit_spin, 2, 1)
         self.processing_check = QtWidgets.QCheckBox("沿用任务额外分析处理（陷波/带通/平滑/Z-score；可能需读整条通道）")
-        self.processing_check.setChecked(True); form.addWidget(self.processing_check, 2, 2, 1, 4)
-        layout.addWidget(self.parameter_box)
+        self.processing_check.setChecked(True); form.addWidget(self.processing_check, 2, 2, 1, 6)
+        parameter_layout.addWidget(self.parameter_box)
+        self.parameter_scroll = QtWidgets.QScrollArea()
+        self.parameter_scroll.setWidgetResizable(True)
+        self.parameter_scroll.setWidget(parameter_panel)
+        self.parameter_scroll.setMaximumHeight(280)
+        layout.addWidget(self.parameter_scroll)
+        self.parameter_toggle.toggled.connect(self._toggle_parameters)
         row = QtWidgets.QHBoxLayout()
         self.run_button = QtWidgets.QPushButton("提取最大峰 / 最小谷并平均")
         self.run_button.setObjectName("primaryAction")
         self.cancel_button = QtWidgets.QPushButton("取消当前操作"); self.cancel_button.setEnabled(False)
+        self.cancel_button.setMinimumWidth(120); self.cancel_button.setMinimumHeight(32)
         self.export_button = QtWidgets.QPushButton("保存完整结果（图 + 明细 + 数据）"); self.export_button.setEnabled(False)
         self.individual_check = QtWidgets.QCheckBox("同时保存每个 trial 的独立 PNG"); self.individual_check.setChecked(True)
-        for widget in (self.run_button, self.cancel_button, self.export_button, self.individual_check):
+        for widget in (self.run_button, self.export_button, self.individual_check):
             row.addWidget(widget)
         layout.addLayout(row)
-        self.progress = QtWidgets.QProgressBar(); layout.addWidget(self.progress)
+        progress_row = QtWidgets.QHBoxLayout()
+        self.progress = QtWidgets.QProgressBar()
+        progress_row.addWidget(self.progress, 1); progress_row.addWidget(self.cancel_button)
+        layout.addLayout(progress_row)
         self.status = QtWidgets.QLabel("设置长度后点击提取；最大值、最小值分开平均，相关系数仅供查看。")
         self.status.setWordWrap(True); layout.addWidget(self.status)
         selection = QtWidgets.QHBoxLayout()
@@ -121,19 +169,29 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.previous_button = QtWidgets.QPushButton("上一页")
         self.next_button = QtWidgets.QPushButton("下一页")
         self.page_label = QtWidgets.QLabel()
-        navigation.addWidget(self.previous_button); navigation.addWidget(self.next_button); navigation.addWidget(self.page_label); navigation.addStretch(1)
+        self.page_label.setWordWrap(True)
+        self.details_per_page_box = QtWidgets.QComboBox()
+        self.details_per_page_box.addItem("每页 4 图（与 PDF 一致）", 4)
+        self.details_per_page_box.addItem("每页 1 图（放大查看）", 1)
+        navigation.addWidget(self.previous_button); navigation.addWidget(self.next_button)
+        navigation.addWidget(self.details_per_page_box); navigation.addWidget(self.page_label, 1)
         details_layout.addLayout(navigation)
-        grid = QtWidgets.QGridLayout(); self.detail_plots = []; self.detail_labels = []; self.detail_slots = []
-        for index in range(4):
-            slot = QtWidgets.QWidget(); body = QtWidgets.QVBoxLayout(slot); body.setContentsMargins(0, 0, 0, 0)
-            label = QtWidgets.QLabel(); label.setWordWrap(True); label.setMinimumHeight(55)
-            label.setStyleSheet("color:#202832; font-size:12px;")
-            plot = self._plot(); body.addWidget(label); body.addWidget(plot, 1)
-            grid.addWidget(slot, index//2, index%2)
-            self.detail_plots.append(plot); self.detail_labels.append(label); self.detail_slots.append(slot)
-        details_layout.addLayout(grid, 1); self.tabs.addTab(details, "逐 Trial 找波与截取详情")
-        self.table = QtWidgets.QTableWidget(0, 12)
-        self.table.setHorizontalHeaderLabels(["原Trial", "Tag内Trial", "Tag", "通道", "峰/谷", "状态", "AnimalStart s", "极值相对 ms", "幅值", "相似度r（不筛选）", "标记", "排除原因"])
+        with rc_context(PLOT_STYLE):
+            self.detail_figure = Figure(figsize=(12, 10), layout="constrained")
+        self.detail_canvas = FigureCanvasQTAgg(self.detail_figure)
+        self.detail_canvas.setMinimumSize(600, 680)
+        self.detail_axes = []
+        self.detail_toolbar = NavigationToolbar2QT(self.detail_canvas, details)
+        self.detail_toolbar.setToolTip("Home：恢复视图；Pan：拖动；Zoom：框选放大；Save：保存当前显示页。")
+        details_layout.addWidget(self.detail_toolbar)
+        self.detail_scroll = QtWidgets.QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setWidget(self.detail_canvas)
+        details_layout.addWidget(self.detail_scroll, 1)
+        self.tabs.addTab(details, "逐 Trial 找波与截取详情")
+        self.table = QtWidgets.QTableWidget(0, 19)
+        self.table.setHorizontalHeaderLabels(["原Trial", "Tag内Trial", "Tag", "通道", "峰/谷", "状态", "AnimalStart s", "极值相对 ms", "幅值", "相似度r（不筛选）", "标记", "具体排除原因",
+                                             "validity", "StartFrame", "AnimalStartFrame", "AnimalStart原值", "AnimalStart相对Letter ms", "检测TXT行号", "排除代码"])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers if hasattr(QtWidgets.QAbstractItemView, "EditTrigger") else QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tabs.addTab(self.table, "全部 Trial 明细 / 排除原因")
         self.run_button.clicked.connect(self.start_analysis)
@@ -143,7 +201,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.tabs.currentChanged.connect(lambda *_: self.render_details() if self.tabs.currentIndex() == 2 else None)
         self.previous_button.clicked.connect(lambda: self._change_page(-1))
         self.next_button.clicked.connect(lambda: self._change_page(1))
-        for widget in (self.search_spin, self.pre_spin, self.post_spin, self.limit_spin):
+        self.details_per_page_box.currentIndexChanged.connect(self._detail_layout_changed)
+        for widget in (self.search_spin, self.search_after_spin, self.pre_spin, self.post_spin, self.limit_spin):
             widget.valueChanged.connect(self.parameters_changed)
         for widget in (self.channel_edit, self.tag_edit):
             widget.textChanged.connect(self.parameters_changed)
@@ -173,10 +232,20 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             self.export_button.setEnabled(False)
             self.status.setText("参数已修改；当前图仍为上次计算结果，请重新提取后导出。")
 
+    def _toggle_parameters(self, expanded):
+        self.parameter_scroll.setVisible(expanded)
+        self.parameter_toggle.setText("收起参数区，扩大绘图区" if expanded else "展开参数区")
+
+    def _detail_layout_changed(self, *_):
+        self._detail_page = 0
+        self.detail_canvas.setMinimumHeight(680 if self.details_per_page_box.currentData() == 4 else 400)
+        self.render_details()
+
     def _set_busy(self, busy):
         self._busy = busy
         self.parameter_box.setEnabled(not busy); self.run_button.setEnabled(not busy)
         self.cancel_button.setEnabled(busy); self.export_button.setEnabled(not busy and self.output is not None)
+        self.cancel_button.setText("取消当前操作")
         self.pair_box.setEnabled(not busy); self.tabs.setEnabled(not busy)
 
     def start_analysis(self):
@@ -185,6 +254,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         try:
             parse = lambda value: list(dict.fromkeys(int(part.strip()) for part in value.replace(";", ",").replace("，", ",").split(",") if part.strip()))
             settings = {**self.defaults, "search_ms": self.search_spin.value(), "pre_ms": self.pre_spin.value(), "post_ms": self.post_spin.value(),
+                        "search_after_ms": self.search_after_spin.value(),
                         "channel_ids": parse(self.channel_edit.text()) or list(self.defaults["channel_ids"]),
                         "tags": parse(self.tag_edit.text()), "trial_limit": self.limit_spin.value(),
                         "processing": dict(self.defaults.get("processing") or {}) if self.processing_check.isChecked() else {}}
@@ -196,26 +266,41 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._pairs = {}
         self._detail_conditioned = None
         self._detail_conditioned_channel = None
-        for plot in self.average_plots + self.histogram_plots + self.detail_plots:
+        for plot in self.average_plots + self.histogram_plots:
             plot.clear()
+        self.detail_figure.clear(); self.detail_axes = []
+        self.detail_canvas.draw_idle()
         self.table.setRowCount(0)
         self._set_busy(True); self.progress.setValue(0)
         self.status.setText("正在逐通道、逐 trial 提取；不读取整份 H5 到内存。")
         self.worker = AnimalPeakWorker(self.source, self.markers, self.matches, settings, self)
         self._wire_worker(self.worker)
-        self.worker.completed.connect(self.analysis_finished)
+        self.worker.completed.connect(lambda output, worker=self.worker:
+                                      self._accept_completion(worker, self.analysis_finished, output))
         self.worker.start()
 
     def _wire_worker(self, worker):
         # The main window's existing shutdown cleanup discovers this handle.
         self.parent()._animal_peak_test_worker = worker
+        if hasattr(self.parent(), "_track_lfp_operation"):
+            label = "峰谷结果导出" if worker.export is not None else "AnimalStart 峰谷测试"
+            self.parent()._track_lfp_operation(worker, label, cancel_notify=self._show_cancel_request)
         worker.progress.connect(self.update_progress)
         worker.failed.connect(self.failed)
         worker.cancelled.connect(self.cancelled)
         worker.finished.connect(self._worker_finished)
 
     def update_progress(self, value, text):
+        if self.worker is not None and (getattr(self.worker, "_ui_cancel_requested", False)
+                                        or self.worker.isInterruptionRequested()):
+            return
         self.progress.setValue(int(value)); self.status.setText(text)
+
+    def _accept_completion(self, worker, callback, value):
+        if getattr(worker, "_ui_cancel_requested", False) or worker.isInterruptionRequested():
+            self.cancelled("已取消测试操作；未显示本次未完成结果。")
+            return
+        callback(value)
 
     def analysis_finished(self, output):
         self.output = output
@@ -233,10 +318,17 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             values = (row["trial_id"], row["tag_trial_id"], row["tag"], row["channel"], row["branch"], row["status"],
                       self._number(row.get("animal_sec"), 6), self._number(row.get("extreme_relative_ms"), 2),
                       self._number(row.get("amplitude", np.nan)*scale) + " " + unit,
-                      self._number(row.get("similarity_r"), 3), row.get("flags", ""), row.get("reason", ""))
+                      self._number(row.get("similarity_r"), 3), row.get("flags", ""), row.get("reason", ""),
+                      row.get("validity", ""), row.get("start_frame", ""), row.get("animal_start_frame", ""),
+                      row.get("animal_start_raw", ""), self._number(row.get("animal_latency_ms"), 3),
+                      row.get("detection_line_number", ""), row.get("reason_code", ""))
             for column, value in enumerate(values):
-                self.table.setItem(index, column, QtWidgets.QTableWidgetItem(str(value)))
+                item = QtWidgets.QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.table.setItem(index, column, item)
         self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(11, min(720, max(420, self.table.columnWidth(11))))
+        self.table.resizeRowsToContents()
         self._detail_page = 0; self.render_pair()
         included = sum(row["status"] == "included" for row in output["records"])
         self.status.setText(f"测试完成：{len(output['eligible_trials'])} 个有效 AnimalStart trial；峰谷分支纳入 {included} 条记录，详情及排除原因已保留。")
@@ -292,36 +384,31 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                 if (row["channel"], row["tag"]) == pair and "extreme_local_sample" in row:
                     details[row["trial_id"]].append(row)
             trials = sorted(details)
-            pages = max(1, (len(trials)+3)//4)
+            per_page = int(self.details_per_page_box.currentData())
+            pages = max(1, (len(trials) + per_page - 1) // per_page)
             self._detail_page = min(self._detail_page, pages-1)
-            shown = trials[self._detail_page*4:(self._detail_page+1)*4]
-            scale = 1000 if self.output["units"] == "mV" else 1
-            for index, plot in enumerate(self.detail_plots):
-                plot.clear(); self.detail_slots[index].setVisible(index < len(shown))
-                if index >= len(shown):
-                    continue
-                rows = details[shown[index]]
-                channel = rows[0]["channel"]
-                if self._detail_conditioned_channel != channel:
-                    self._detail_conditioned = _condition_channel(self.source, rows[0]["column"], self.output["settings"])
-                    self._detail_conditioned_channel = channel
-                t, values = trial_detail_trace(self.source, self.output, rows, self._detail_conditioned)
-                plot.plot(t, values*scale, pen=pg.mkPen("#30343a", width=.8))
-                animal = pg.InfiniteLine(0, pen="#9467bd", label="AnimalStart"); plot.addItem(animal)
-                search = pg.LinearRegionItem([-self.output["settings"]["search_ms"], 0], movable=False, brush=(100, 160, 210, 25))
-                plot.addItem(search)
-                subtitles = []
-                for row in rows:
-                    color = "#d44436" if row["branch"] == "peak" else "#16885b"
-                    name = "峰" if row["branch"] == "peak" else "谷"
-                    position = row["extreme_relative_ms"]
-                    plot.plot([position], [row["amplitude"]*scale], pen=None, symbol="o", symbolBrush=color)
-                    region = pg.LinearRegionItem([position-self.output["settings"]["pre_ms"], position+self.output["settings"]["post_ms"]], movable=False, brush=pg.mkBrush(color))
-                    region.setBrush(pg.mkBrush(210, 100, 80, 12) if row["branch"] == "peak" else pg.mkBrush(50, 160, 90, 12)); plot.addItem(region)
-                    subtitles.append(f"{name} {position:.2f}ms, r={self._number(row['similarity_r'], 2)}")
-                flags = "；".join(dict.fromkeys(filter(None, (row["flags"] or row["reason"] for row in rows))))
-                self.detail_labels[index].setText(f"ch{rows[0]['channel']} | Tag {rows[0]['tag']} | 原Trial {rows[0]['trial_id']} | Tag内 {rows[0]['tag_trial_id']}\nAnimalStart {rows[0]['animal_sec']:.6f}s | {' / '.join(subtitles)}\n{flags or '完整截取；相似度不筛选'}")
-                plot.setLabel("bottom", "相对 AnimalStart", units="ms"); plot.setLabel("left", "μV" if scale == 1000 else "z")
+            shown = trials[self._detail_page * per_page:(self._detail_page + 1) * per_page]
+            with rc_context(PLOT_STYLE):
+                self.detail_figure.clear()
+                self.detail_axes = np.atleast_1d(self.detail_figure.subplots(
+                    2 if per_page == 4 else 1, 2 if per_page == 4 else 1,
+                )).ravel().tolist()
+                self.detail_figure.suptitle(
+                    f"{Path(self.output['source']['path']).name} | 逐 Trial 找波与截取详情", fontsize=12,
+                )
+                for index, axis in enumerate(self.detail_axes):
+                    axis.set_visible(index < len(shown))
+                    if index >= len(shown):
+                        continue
+                    rows = details[shown[index]]
+                    channel = rows[0]["channel"]
+                    if self._detail_conditioned_channel != channel:
+                        self._detail_conditioned = _condition_channel(self.source, rows[0]["column"], self.output["settings"])
+                        self._detail_conditioned_channel = channel
+                    t, values = trial_detail_trace(self.source, self.output, rows, self._detail_conditioned)
+                    draw_trial_detail(axis, self.output, rows, t, values)
+            self.detail_toolbar.update()  # Discard zoom history from the previous page/tag.
+            self.detail_canvas.draw_idle()
             self.page_label.setText(f"第 {self._detail_page+1}/{pages} 页 | {len(trials)} 个 trial；红=峰，绿=谷，紫=AnimalStart")
             self.previous_button.setEnabled(self._detail_page > 0); self.next_button.setEnabled(self._detail_page+1 < pages)
         except Exception as exc:
@@ -344,20 +431,34 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.worker = AnimalPeakWorker(self.source, None, None, {}, self,
                                        export=(self.output, directory, self.individual_check.isChecked()))
         self._wire_worker(self.worker)
-        self.worker.completed.connect(lambda folder: self.status.setText(f"完整测试结果已保存：{folder}"))
+        self.worker.completed.connect(lambda folder, worker=self.worker: self._accept_completion(
+            worker, lambda value: self.status.setText(f"完整测试结果已保存：{value}"), folder))
         self.worker.start()
 
     def cancel(self):
         if self.worker is not None and self.worker.isRunning():
-            self.worker.requestInterruption(); self.status.setText("已请求取消，正在完成当前片段/当前页…")
+            self.worker._ui_cancel_requested = True
+            if hasattr(self.parent(), "_mark_lfp_cancel_requested"):
+                self.parent()._mark_lfp_cancel_requested(self.worker)
+            self.worker.cancel()
+            self._show_cancel_request()
+
+    def _show_cancel_request(self):
+        self.status.setText("正在取消，等待当前片段/当前页安全结束…")
+        self.cancel_button.setText("取消中…"); self.cancel_button.setEnabled(False)
 
     def failed(self, message):
+        if self.worker is not None and (getattr(self.worker, "_ui_cancel_requested", False)
+                                        or self.worker.isInterruptionRequested()):
+            self.cancelled(message)
+            return
         self.status.setText(message)
         if not self._close_requested:
             QtWidgets.QMessageBox.warning(self, "测试操作未完成", message)
 
-    def cancelled(self):
-        self.status.setText("已取消测试计算；未修改原数据及原任务结果。")
+    def cancelled(self, message="已取消测试操作"):
+        self.progress.setValue(0)
+        self.status.setText(message + "\n未修改原数据及原任务结果。")
 
     def _worker_finished(self):
         worker = self.worker

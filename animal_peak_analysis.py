@@ -14,6 +14,8 @@ import uuid
 
 import numpy as np
 
+from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
+
 
 class AnalysisCancelled(Exception):
     pass
@@ -42,6 +44,7 @@ def _condition_channel(source, column, settings, cancel=None):
         raise ValueError("额外分析处理需要读取整条通道，超过测试内存预算。请关闭额外分析处理，使用已经预处理的数据。")
     _check(cancel)
     values = np.array(source.read(0, meta.rows, [column]), dtype=np.float32, copy=True).reshape(-1, 1)
+    _check(cancel)
     if processing.get("analysis_notch") or processing.get("analysis_bandpass"):
         from qt_data_model import filter_array
         values, cache = filter_array(
@@ -49,6 +52,7 @@ def _condition_channel(source, column, settings, cancel=None):
             float(processing.get("analysis_band_low", .5)), float(processing.get("analysis_band_high", 300)),
             notch=bool(processing.get("analysis_notch")),
         )
+        _check(cancel)
         if cache is not None:
             raise ValueError("测试分析不支持额外处理产生的磁盘缓存；请先在预处理页完成处理。")
     values = values[:, 0]
@@ -58,9 +62,11 @@ def _condition_channel(source, column, settings, cancel=None):
             if width > values.size:
                 raise ValueError("平滑窗不能长于整条记录。")
             values = np.convolve(values, np.ones(width, dtype=np.float32) / width, mode="same")
+            _check(cancel)
     if processing.get("zscore"):
         deviation = np.nanstd(values)
         values = (values - np.nanmean(values)) / (deviation if deviation > 0 else 1.0)
+    _check(cancel)
     return values
 
 
@@ -72,7 +78,7 @@ def _read(source, column, first, last, conditioned=None):
     return values
 
 
-def _summarize(waves):
+def _summarize(waves, cancel=None):
     """Equal-trial mean/SEM and leave-one-out shape correlation; no rejection."""
     finite = np.isfinite(waves)
     count = np.sum(finite, axis=0)
@@ -83,6 +89,7 @@ def _summarize(waves):
     sem = np.sqrt(np.divide(variance, count, out=np.full(mean.size, np.nan), where=count > 1))
     correlations = []
     for index, wave in enumerate(waves):
+        _check(cancel)
         others_count = count - finite[index]
         others_total = total - np.where(finite[index], wave, 0)
         template = np.divide(others_total, others_count, out=np.full(mean.size, np.nan), where=others_count > 0)
@@ -94,24 +101,51 @@ def _summarize(waves):
     return mean.astype(np.float32), sem.astype(np.float32), count, correlations
 
 
+def _animal_exclusion(event, latency):
+    """Explain the first failed validity/timing condition without changing it."""
+    validity = event.get("validity")
+    if validity != "Y":
+        if validity in (None, ""):
+            return "validity_missing", "validity 为空；视频检测 TXT 第5列未提供有效性标记，要求 Y"
+        return "validity_not_y", f"validity 不是 Y；实际值={validity!r}，要求 Y（视频检测 TXT 第5列）"
+    if np.isfinite(latency):
+        return "", ""
+    animal = event.get("animal_start_frame")
+    start = event.get("start_frame")
+    if event.get("animal_start_status") == "unparseable":
+        return "animal_frame_unparseable", f"AnimalStart 帧号无法解析；TXT 第4列原值={event.get('animal_start_raw')!r}"
+    if animal is None:
+        raw = event.get("animal_start_raw", "未保留原值")
+        return "animal_frame_missing", f"AnimalStart 帧号缺失；TXT 第4列原值={raw!r}，没有可用于对齐的帧号"
+    if start is not None:
+        if animal == start:
+            return "animal_frame_equal_start", f"AnimalStart 帧号等于 StartFrame；AnimalStartFrame={animal}，StartFrame={start}，当前要求 AnimalStartFrame > StartFrame"
+        if animal < start:
+            return "animal_frame_before_start", f"AnimalStart 帧号早于 StartFrame；AnimalStartFrame={animal}，StartFrame={start}，当前要求 AnimalStartFrame > StartFrame"
+    return "animal_latency_nonfinite", f"AnimalStart 对齐延迟不是有限数值；animal_latency_sec={event.get('animal_latency_sec')!r}，AnimalStartFrame={animal}，StartFrame={start}"
+
+
 def analyze_animal_peaks(source, markers, matches, settings, progress=None, cancel=None):
-    """Find one maximum AND minimum in each eligible pre-AnimalStart trial.
+    """Find one maximum AND minimum around AnimalStart in each eligible trial.
 
     Eligibility is tied to the existing Letter epoch. Excerpts may extend
     beyond that epoch (including beyond AnimalStart), but never beyond source
-    bounds. Extremum ties choose the last sample, nearest AnimalStart.
+    bounds. Extremum ties choose the point nearest AnimalStart, then latest.
     """
+    _check(cancel)
     meta = source.metadata
     initial_identity = source_identity(source)
     fs = float(meta.fs)
     settings = dict(settings)
     settings.setdefault("memory_budget_bytes", 256 * 1024 * 1024)
-    for key in ("search_ms", "pre_ms", "post_ms", "epoch_start_ms", "epoch_end_ms", "baseline_start_ms", "baseline_end_ms"):
+    settings.setdefault("search_after_ms", 0.0)
+    for key in ("search_ms", "search_after_ms", "pre_ms", "post_ms", "epoch_start_ms", "epoch_end_ms", "baseline_start_ms", "baseline_end_ms"):
         if not np.isfinite(float(settings[key])):
             raise ValueError(f"参数 {key} 必须为有限数值")
-    if settings["search_ms"] <= 0 or min(settings["pre_ms"], settings["post_ms"]) < 0:
-        raise ValueError("搜索长度必须大于 0，峰前/峰后长度不能为负。")
+    if settings["search_ms"] <= 0 or min(settings["search_after_ms"], settings["pre_ms"], settings["post_ms"]) < 0:
+        raise ValueError("AnimalStart 前搜索长度必须大于 0，后搜索长度及峰前/峰后截取长度不能为负。")
     search_samples = max(1, int(round(settings["search_ms"] * fs / 1000)))
+    search_after_samples = int(round(settings["search_after_ms"] * fs / 1000))
     pre = int(round(settings["pre_ms"] * fs / 1000))
     post = int(round(settings["post_ms"] * fs / 1000))
     if pre + post + 1 < 3:
@@ -140,6 +174,7 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
     tag_counts = defaultdict(int)
     eligible, excluded = [], []
     for trial_id, (sample, tag) in enumerate(letter, start=1):
+        _check(cancel)
         tag_counts[tag] += 1
         if tag not in wanted or (limit and tag_counts[tag] > limit):
             continue
@@ -147,23 +182,49 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                "marker_sample": sample, "marker_sec": sample / fs}
         event = matches.get(sample)
         reason = ""
-        latency = float(event.get("animal_latency_sec", np.nan)) if event else np.nan
+        reason_code = ""
+        try:
+            latency = float(event.get("animal_latency_sec", np.nan)) if event else np.nan
+        except (TypeError, ValueError):
+            latency = np.nan
         first, last = sample - offset + epoch_first, sample - offset + epoch_last
         animal_global = int(round(sample + latency * fs)) if np.isfinite(latency) else -1
         animal = animal_global - offset
         row.update(animal_sec=(sample / fs + latency), animal_sample=animal_global,
                    animal_latency_ms=latency * 1000, animal_local_sample=animal)
+        row.update({name: event.get(name, "") if event is not None else "" for name in (
+            "validity", "start_frame", "animal_start_frame", "animal_start_raw", "animal_start_status",
+            "validity_raw", "detection_line_number",
+        )})
+        epoch_range = f"Epoch=[{epoch_first / fs * 1000:g}, {epoch_last / fs * 1000:g}) ms（相对 Letter）"
         if event is None:
-            reason = "无对应行为记录"
-        elif event.get("validity") != "Y" or not np.isfinite(latency):
-            reason = "AnimalStart 无效或 validity 非 Y"
-        elif first < 0 or last > meta.rows:
-            reason = "原 Letter Epoch 超出当前数据段"
-        elif animal < first or animal >= last:
-            reason = "AnimalStart 不在原 Letter Epoch 内"
-        elif animal - search_samples < first:
-            reason = "原 Letter Epoch 未覆盖完整搜索范围"
-        row.update(epoch_first=first, epoch_last=last, search_first=animal - search_samples, search_last=animal)
+            reason_code = "behavior_unmatched"
+            reason = f"无对应行为记录；marker_sample={sample}，Tag={tag}，对齐结果中没有该 marker 的视频匹配项"
+        else:
+            reason_code, reason = _animal_exclusion(event, latency)
+        if not reason:
+            if first < 0:
+                reason_code = "epoch_before_data"
+                reason = f"原 Letter Epoch 起点早于当前数据段；Epoch 本地样本范围=[{first}, {last})，数据范围=[0, {meta.rows})"
+            elif last > meta.rows:
+                reason_code = "epoch_after_data"
+                reason = f"原 Letter Epoch 终点超过当前数据段；Epoch 本地样本范围=[{first}, {last})，数据范围=[0, {meta.rows})"
+            elif animal < first:
+                reason_code = "animal_before_epoch"
+                reason = f"AnimalStart 早于原 Letter Epoch 起点；AnimalStart 相对 Letter={latency * 1000:.3f} ms，{epoch_range}"
+            elif animal >= last:
+                reason_code = "animal_at_epoch_end" if animal == last else "animal_after_epoch"
+                description = "正好位于" if animal == last else "晚于"
+                reason = f"AnimalStart {description}原 Letter Epoch 终点；AnimalStart 相对 Letter={latency * 1000:.3f} ms，{epoch_range}，该时刻不在 Epoch 内"
+            elif animal - search_samples < first:
+                reason_code = "search_before_epoch"
+                reason = f"原 Letter Epoch 未覆盖完整搜索范围：搜索起点早于 Epoch 起点；搜索起点相对 Letter={(animal - search_samples - (sample - offset)) / fs * 1000:.3f} ms，{epoch_range}"
+            elif animal + search_after_samples > last:
+                reason_code = "search_after_epoch"
+                reason = f"原 Letter Epoch 未覆盖完整搜索范围：搜索终点超过 Epoch 终点；搜索终点相对 Letter={(animal + search_after_samples - (sample - offset)) / fs * 1000:.3f} ms，{epoch_range}"
+        row["reason_code"] = reason_code
+        row.update(epoch_first=first, epoch_last=last, search_first=animal - search_samples,
+                   search_last=animal + search_after_samples)
         if reason:
             excluded.append({**row, "channel": "", "branch": "both", "status": "excluded", "reason": reason})
         else:
@@ -184,9 +245,11 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
         column = lookup[channel]
         conditioned = _condition_channel(source, column, settings, cancel)
         def read(first, last):
+            _check(cancel)
             if source_identity(source) != initial_identity:
                 raise ValueError("计算期间数据源已改变，请重新打开测试窗口。")
             values = _read(source, column, first, last, conditioned)
+            _check(cancel)
             if source_identity(source) != initial_identity:
                 raise ValueError("读取期间数据源已改变，请重新打开测试窗口。")
             return values
@@ -199,13 +262,22 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
             search = read(trial["search_first"], trial["search_last"])
             valid = np.isfinite(search)
             if not finite_base.size or not valid.any():
+                if not finite_base.size:
+                    code = "baseline_no_finite"
+                    detail = f"基线窗没有有效数值；有限采样点=0/{base.size}，本地样本范围=[{center + base_first}, {center + base_last})"
+                else:
+                    code = "search_no_finite"
+                    detail = f"搜索窗没有有效数值；有限采样点=0/{search.size}，本地样本范围=[{trial['search_first']}, {trial['search_last']})"
                 records.append({**trial, "channel": channel, "branch": "both", "status": "excluded",
-                                "reason": "基线或搜索范围无有限数值"})
+                                "reason": detail, "reason_code": code})
             else:
                 correction = float(np.mean(finite_base))
                 flat = bool(np.max(search[valid]) == np.min(search[valid]))
                 for branch, extreme in (("peak", np.max(search[valid])), ("trough", np.min(search[valid]))):
-                    index = int(np.flatnonzero(valid & (search == extreme))[-1])
+                    _check(cancel)
+                    candidates = np.flatnonzero(valid & (search == extreme))
+                    distance = np.abs(trial["search_first"] + candidates - trial["animal_local_sample"])
+                    index = int(candidates[distance == distance.min()][-1])
                     position = trial["search_first"] + index
                     left, right = position - pre, position + post + 1
                     flags = []
@@ -223,8 +295,12 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                            "excerpt_first": left, "excerpt_last": right,
                            "crosses_animal_start": right > trial["animal_local_sample"],
                            "flags": "; ".join(flags), "similarity_r": np.nan}
-                    if left < 0 or right > meta.rows:
-                        row.update(status="excluded", reason="峰/谷已找到，但完整截取片段超出源数据边界")
+                    if left < 0:
+                        row.update(status="excluded", reason_code="excerpt_before_data",
+                                   reason=f"完整截取片段超出源数据边界：截取起点早于数据起点；片段本地样本范围=[{left}, {right})，数据范围=[0, {meta.rows})，仅排除本峰谷分支的平均")
+                    elif right > meta.rows:
+                        row.update(status="excluded", reason_code="excerpt_after_data",
+                                   reason=f"完整截取片段超出源数据边界：截取终点超过数据终点；片段本地样本范围=[{left}, {right})，数据范围=[0, {meta.rows})，仅排除本峰谷分支的平均")
                     else:
                         wave = read(left, right).copy() - correction
                         wave[~np.isfinite(wave)] = np.nan
@@ -235,8 +311,9 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
             if progress:
                 progress(100 * completed / total, f"测试峰谷：ch{channel}，Trial {trial['trial_id']} / Tag {trial['tag']}")
         for (tag, branch), entries in sorted(buckets.items()):
+            _check(cancel)
             waves = np.stack([entry[1] for entry in entries])
-            mean, sem, count, correlations = _summarize(waves)
+            mean, sem, count, correlations = _summarize(waves, cancel)
             for (row, _), correlation in zip(entries, correlations):
                 row["similarity_r"] = correlation
             groups.append({"channel": channel, "tag": tag, "branch": branch,
@@ -244,6 +321,7 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                            "waves": waves, "mean": mean, "sem": sem, "valid_count": count,
                            "rows": [entry[0] for entry in entries]})
         del conditioned, buckets
+    _check(cancel)
     return {"settings": settings, "groups": groups, "records": records, "eligible_trials": eligible,
             "source_identity": source_identity(source), "source": _source_metadata(meta), "fs": fs,
             "units": "z" if (settings.get("processing") or {}).get("zscore") else "mV"}
@@ -293,6 +371,7 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
     A new directory prevents overwrites. Cancellation leaves clearly marked,
     recoverable partial output, never deleting recordings or existing exports.
     """
+    _check(cancel)
     from matplotlib import rc_context
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -325,15 +404,14 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
     count = len(pairs) + len(detail_sets)
     done = 0
     try:
-        with rc_context({"font.family": ["Microsoft YaHei", "SimHei", "DejaVu Sans"], "axes.unicode_minus": False,
-                         "font.size": 9, "pdf.fonttype": 42}), PdfPages(folder / "all_trial_details.pdf") as pdf:
+        with rc_context(PLOT_STYLE), PdfPages(folder / "all_trial_details.pdf") as pdf:
             _check(cancel)
             overview = Figure(figsize=(12, 8), layout="constrained"); FigureCanvasAgg(overview)
             axis = overview.subplots(); axis.set_axis_off()
             reasons = defaultdict(int)
             for row in records:
                 if row["status"] == "excluded":
-                    reasons[row["reason"]] += 1
+                    reasons[row["reason"].split("；", 1)[0]] += 1
             configuration = output["settings"]
             channel_label = str(configuration["channel_ids"][:20])
             if len(configuration["channel_ids"]) > 20:
@@ -344,9 +422,9 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                 f"通道：{channel_label} | Tag：{configuration.get('tags') or '全部 Letter Tag'}",
                 f"原 Letter Epoch：{configuration['epoch_start_ms']:g}～{configuration['epoch_end_ms']:g} ms",
                 f"原 Letter 基线：{configuration['baseline_start_ms']:g}～{configuration['baseline_end_ms']:g} ms",
-                f"AnimalStart 前搜索：{configuration['search_ms']:g} ms | 极值前/后截取：{configuration['pre_ms']:g}/{configuration['post_ms']:g} ms",
+                f"AnimalStart 前/后搜索：{configuration['search_ms']:g}/{configuration.get('search_after_ms', 0):g} ms | 极值前/后截取：{configuration['pre_ms']:g}/{configuration['post_ms']:g} ms",
                 f"有效 AnimalStart Trial：{len(output['eligible_trials'])} | 峰谷纳入记录：{sum(r['status']=='included' for r in records)}",
-                "每个有效 trial 都选最大值和最小值；同值取更接近 AnimalStart 的采样点。",
+                "每个有效 trial 都选最大值和最小值；同值取更接近 AnimalStart 的采样点，等距离取较晚点。",
                 "正负分支独立平均，不反转、不归一化；相似度仅报告，不筛选。",
                 "平均图零点=选中极值；逐 trial 详情零点=AnimalStart。",
                 "排除原因（包含原 trial 排除及通道/分支不可计算记录）：",
@@ -437,28 +515,11 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                     axes = page.subplots(2, 2).ravel()
                     page.suptitle(f"{Path(output['source']['path']).name} | 逐 Trial 找波与截取详情", fontsize=12)
 
-                def draw_detail(axis):
-                    axis.plot(time_ms, values * scale, color="#30343a", linewidth=.7)
-                    axis.axvspan(-output["settings"]["search_ms"], 0, color="#8cb8d8", alpha=.15, label="搜索区")
-                    axis.axvline(0, color="#9467bd", linestyle="--", label="AnimalStart")
-                    for row in rows:
-                        color = "#d44436" if row["branch"] == "peak" else "#16885b"
-                        label = "峰" if row["branch"] == "peak" else "谷"
-                        axis.scatter([row["extreme_relative_ms"]], [row["amplitude"]*scale], color=color, s=22, zorder=3)
-                        axis.axvspan(row["extreme_relative_ms"]-output["settings"]["pre_ms"],
-                                     row["extreme_relative_ms"]+output["settings"]["post_ms"], color=color, alpha=.07)
-                        axis.plot([], [], color=color, label=f"{label}: {row['extreme_relative_ms']:.2f} ms, {row['amplitude']*scale:.3g} {unit}, r={row['similarity_r']:.2f}")
-                    flags = "; ".join(filter(None, (row["flags"] or row["reason"] for row in rows)))
-                    axis.set_title(f"ch{channel} | Tag {tag} | 原 Trial {trial_id} | Tag 内 {rows[0]['tag_trial_id']}\nAnimalStart={rows[0]['animal_sec']:.6f} s\n{flags or '完整片段；无相似度筛选'}", fontsize=9, wrap=True)
-                    axis.set(xlabel="相对 AnimalStart（ms）", ylabel=unit)
-                    axis.legend(fontsize=7, loc="best")
-                    axis.grid(alpha=.15)
-
-                draw_detail(axes[page_index])
+                draw_trial_detail(axes[page_index], output, rows, time_ms, values)
                 if individual_png:
                     single = Figure(figsize=(10, 5), layout="constrained"); FigureCanvasAgg(single)
                     single.suptitle(Path(output["source"]["path"]).name, fontsize=10)
-                    draw_detail(single.subplots())
+                    draw_trial_detail(single.subplots(), output, rows, time_ms, values)
                     single.savefig(folder / f"ch{channel}_tag{tag}_trial{trial_id:05d}_detail.png", dpi=220)
                     single.clear()
                 page_index += 1
@@ -470,6 +531,7 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                 if progress:
                     progress(done / max(1, count) * 100, f"导出详情：ch{channel} / Tag {tag} / Trial {trial_id}")
             save_trace_part()
+        _check(cancel)
         manifest["status"] = "complete"
         manifest["record_count"] = len(records)
         manifest["detail_trial_channel_count"] = len(detail_sets)
@@ -478,5 +540,6 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
         manifest["status"] = "cancelled" if isinstance(exc, AnalysisCancelled) else "failed"
         manifest["error"] = str(exc)
         save_manifest()
-        raise RuntimeError(f"{exc}\n已保留部分输出（未删除）：{folder}") from exc
+        error_type = AnalysisCancelled if isinstance(exc, AnalysisCancelled) else RuntimeError
+        raise error_type(f"{exc}\n已保留部分输出（未删除）：{folder}") from exc
     return folder
