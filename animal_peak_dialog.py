@@ -18,7 +18,7 @@ from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
 
 from animal_peak_analysis import (
     AnalysisCancelled, analyze_animal_peaks, export_animal_peak_results, trial_detail_trace,
-    _condition_channel,
+    _condition_channel, trial_detail_localization,
 )
 
 
@@ -129,12 +129,27 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         for column, (label, widget) in enumerate((("AnimalStart 前搜索 ms", self.search_spin),
                                                 ("AnimalStart 后搜索 ms", self.search_after_spin),
                                                 ("特征点前截取 ms", self.pre_spin), ("特征点后截取 ms", self.post_spin))):
-            form.addWidget(QtWidgets.QLabel(label), 0, column*2); form.addWidget(widget, 0, column*2+1)
-        form.addWidget(QtWidgets.QLabel("实际通道号"), 1, 0); form.addWidget(self.channel_edit, 1, 1, 1, 3)
-        form.addWidget(QtWidgets.QLabel("Tag"), 1, 4); form.addWidget(self.tag_edit, 1, 5, 1, 3)
-        form.addWidget(QtWidgets.QLabel("每 Tag Trial 上限"), 2, 0); form.addWidget(self.limit_spin, 2, 1)
+            form.addWidget(QtWidgets.QLabel(label), 1, column*2); form.addWidget(widget, 1, column*2+1)
+        form.addWidget(QtWidgets.QLabel("实际通道号"), 3, 0); form.addWidget(self.channel_edit, 3, 1, 1, 3)
+        form.addWidget(QtWidgets.QLabel("Tag"), 3, 4); form.addWidget(self.tag_edit, 3, 5, 1, 3)
+        form.addWidget(QtWidgets.QLabel("每 Tag Trial 上限"), 4, 0); form.addWidget(self.limit_spin, 4, 1)
         self.processing_check = QtWidgets.QCheckBox("沿用任务额外分析处理（陷波/带通/平滑/Z-score；可能需读整条通道）")
-        self.processing_check.setChecked(True); form.addWidget(self.processing_check, 2, 2, 1, 6)
+        self.processing_check.setChecked(True); form.addWidget(self.processing_check, 4, 2, 1, 6)
+        self.localization_box = QtWidgets.QComboBox()
+        self.localization_box.addItem("原波形极值定位（旧方式）", "raw")
+        self.localization_box.addItem("去毛刺＋趋势线定位（平均载入波形）", "trend")
+        self.despike_spin = self._spin(5, 0, 1000)
+        self.mad_spin = self._spin(6, .1, 100)
+        self.trend_spin = self._spin(20, .1, 1000)
+        form.addWidget(QtWidgets.QLabel("定位方式"), 0, 0)
+        form.addWidget(self.localization_box, 0, 1, 1, 7)
+        for column, (text, widget) in enumerate((("去毛刺窗 ms（0关闭）", self.despike_spin),
+                                               ("异常阈值 MAD 倍数", self.mad_spin),
+                                               ("趋势平滑窗 ms", self.trend_spin))):
+            form.addWidget(QtWidgets.QLabel(text), 2, column * 2)
+            form.addWidget(widget, 2, column * 2 + 1)
+        self.localization_hint = QtWidgets.QLabel()
+        self.localization_hint.setWordWrap(True); form.addWidget(self.localization_hint, 5, 0, 1, 8)
         parameter_layout.addWidget(self.parameter_box)
         self.parameter_scroll = QtWidgets.QScrollArea()
         self.parameter_scroll.setWidgetResizable(True)
@@ -173,9 +188,17 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.details_per_page_box = QtWidgets.QComboBox()
         self.details_per_page_box.addItem("每页 4 图（与 PDF 一致）", 4)
         self.details_per_page_box.addItem("每页 1 图（放大查看）", 1)
+        self.detail_curve_box = QtWidgets.QComboBox()
+        self.detail_curve_box.setEnabled(False)
+        for text, value in (("原波形＋定位趋势", "overlay"), ("仅原波形", "raw"),
+                            ("仅定位趋势（无原始尖刺）", "trend"), ("仅去毛刺曲线", "despiked")):
+            self.detail_curve_box.addItem(text, value)
         navigation.addWidget(self.previous_button); navigation.addWidget(self.next_button)
         navigation.addWidget(self.details_per_page_box); navigation.addWidget(self.page_label, 1)
         details_layout.addLayout(navigation)
+        curve_row = QtWidgets.QHBoxLayout()
+        curve_row.addWidget(QtWidgets.QLabel("显示曲线")); curve_row.addWidget(self.detail_curve_box)
+        curve_row.addStretch(1); details_layout.addLayout(curve_row)
         with rc_context(PLOT_STYLE):
             self.detail_figure = Figure(figsize=(12, 10), layout="constrained")
         self.detail_canvas = FigureCanvasQTAgg(self.detail_figure)
@@ -189,11 +212,13 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.detail_scroll.setWidget(self.detail_canvas)
         details_layout.addWidget(self.detail_scroll, 1)
         self.tabs.addTab(details, "逐 Trial 找波与截取详情")
-        self.table = QtWidgets.QTableWidget(0, 19)
+        self.table = QtWidgets.QTableWidget(0, 23)
         self.table.setHorizontalHeaderLabels(["原Trial", "Tag内Trial", "Tag", "通道", "峰/谷", "状态", "AnimalStart s", "极值相对 ms", "幅值", "相似度r（不筛选）", "标记", "具体排除原因",
-                                             "validity", "StartFrame", "AnimalStartFrame", "AnimalStart原值", "AnimalStart相对Letter ms", "检测TXT行号", "排除代码"])
+                                             "validity", "StartFrame", "AnimalStartFrame", "AnimalStart原值", "AnimalStart相对Letter ms", "检测TXT行号", "排除代码",
+                                             "定位方式", "定位曲线幅值", "原极值相对ms（仅对照）", "搜索区去毛刺点数"])
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers if hasattr(QtWidgets.QAbstractItemView, "EditTrigger") else QtWidgets.QAbstractItemView.NoEditTriggers)
         self.tabs.addTab(self.table, "全部 Trial 明细 / 排除原因")
+        self.animal_reference_plots = self._plot_tab("AnimalStart 直接对齐对照", 1, 1)
         self.run_button.clicked.connect(self.start_analysis)
         self.cancel_button.clicked.connect(self.cancel)
         self.export_button.clicked.connect(self.start_export)
@@ -202,11 +227,15 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.previous_button.clicked.connect(lambda: self._change_page(-1))
         self.next_button.clicked.connect(lambda: self._change_page(1))
         self.details_per_page_box.currentIndexChanged.connect(self._detail_layout_changed)
-        for widget in (self.search_spin, self.search_after_spin, self.pre_spin, self.post_spin, self.limit_spin):
+        self.detail_curve_box.currentIndexChanged.connect(lambda *_: self.render_details())
+        self.localization_box.currentIndexChanged.connect(self._localization_changed)
+        for widget in (self.search_spin, self.search_after_spin, self.pre_spin, self.post_spin, self.limit_spin,
+                       self.despike_spin, self.mad_spin, self.trend_spin):
             widget.valueChanged.connect(self.parameters_changed)
         for widget in (self.channel_edit, self.tag_edit):
             widget.textChanged.connect(self.parameters_changed)
         self.processing_check.toggled.connect(self.parameters_changed)
+        self._localization_changed()
 
     @staticmethod
     def _spin(value, low, high):
@@ -236,6 +265,17 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.parameter_scroll.setVisible(expanded)
         self.parameter_toggle.setText("收起参数区，扩大绘图区" if expanded else "展开参数区")
 
+    def _localization_changed(self, *_, mark_changed=True):
+        trend = self.localization_box.currentData() == "trend"
+        for widget in (self.despike_spin, self.mad_spin, self.trend_spin):
+            widget.setEnabled(trend)
+        self.processing_check.setEnabled(not trend)
+        self.localization_hint.setText(
+            "趋势定位：局部中位数/MAD 去毛刺，再以居中二阶 Savitzky–Golay 平滑找正峰/负谷；仅定位，不改变载入波形及平均。5/6/20 为试用初值，不代表最优参数。"
+            if trend else "旧方式保持原有计算；选择趋势定位可减少孤立尖刺对极值位置的影响。")
+        if mark_changed:
+            self.parameters_changed()
+
     def _detail_layout_changed(self, *_):
         self._detail_page = 0
         self.detail_canvas.setMinimumHeight(680 if self.details_per_page_box.currentData() == 4 else 400)
@@ -247,6 +287,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.cancel_button.setEnabled(busy); self.export_button.setEnabled(not busy and self.output is not None)
         self.cancel_button.setText("取消当前操作")
         self.pair_box.setEnabled(not busy); self.tabs.setEnabled(not busy)
+        if not busy:
+            self._localization_changed(mark_changed=False)
 
     def start_analysis(self):
         if self._busy:
@@ -255,9 +297,13 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             parse = lambda value: list(dict.fromkeys(int(part.strip()) for part in value.replace(";", ",").replace("，", ",").split(",") if part.strip()))
             settings = {**self.defaults, "search_ms": self.search_spin.value(), "pre_ms": self.pre_spin.value(), "post_ms": self.post_spin.value(),
                         "search_after_ms": self.search_after_spin.value(),
+                        "localization_mode": self.localization_box.currentData(),
+                        "despike_window_ms": self.despike_spin.value(), "despike_mad_threshold": self.mad_spin.value(),
+                        "trend_window_ms": self.trend_spin.value(),
                         "channel_ids": parse(self.channel_edit.text()) or list(self.defaults["channel_ids"]),
                         "tags": parse(self.tag_edit.text()), "trial_limit": self.limit_spin.value(),
-                        "processing": dict(self.defaults.get("processing") or {}) if self.processing_check.isChecked() else {}}
+                        "processing": dict(self.defaults.get("processing") or {})
+                        if self.processing_check.isChecked() and self.localization_box.currentData() == "raw" else {}}
             if any(tag not in (4, 5, 6, 7) for tag in settings["tags"]):
                 raise ValueError("此测试只支持 Letter Tag 4/5/6/7。")
         except ValueError as exc:
@@ -266,7 +312,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._pairs = {}
         self._detail_conditioned = None
         self._detail_conditioned_channel = None
-        for plot in self.average_plots + self.histogram_plots:
+        for plot in self.average_plots + self.histogram_plots + self.animal_reference_plots:
             plot.clear()
         self.detail_figure.clear(); self.detail_axes = []
         self.detail_canvas.draw_idle()
@@ -307,6 +353,9 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._pairs = defaultdict(dict)
         for group in output["groups"]:
             self._pairs[(group["channel"], group["tag"])][group["branch"]] = group
+        for group in output.get("animal_reference_groups", []):
+            self._pairs.setdefault((group["channel"], group["tag"]), {})
+        self.detail_curve_box.setEnabled(output["settings"].get("localization_mode", "raw") == "trend")
         self.pair_box.blockSignals(True); self.pair_box.clear()
         for pair in sorted(self._pairs):
             self.pair_box.addItem(f"ch{pair[0]} / Tag {pair[1]}", pair)
@@ -321,7 +370,9 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                       self._number(row.get("similarity_r"), 3), row.get("flags", ""), row.get("reason", ""),
                       row.get("validity", ""), row.get("start_frame", ""), row.get("animal_start_frame", ""),
                       row.get("animal_start_raw", ""), self._number(row.get("animal_latency_ms"), 3),
-                      row.get("detection_line_number", ""), row.get("reason_code", ""))
+                      row.get("detection_line_number", ""), row.get("reason_code", ""), row.get("localization_mode", ""),
+                      self._number(row.get("localization_amplitude", np.nan) * scale),
+                      self._number(row.get("raw_extreme_relative_ms")), row.get("despike_count_search", ""))
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
@@ -367,6 +418,20 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             histogram.setLabel("bottom", "相对 AnimalStart", units="ms"); histogram.setLabel("left", "Trial 数")
             counts.append(f"{name} n={len(group['rows'])}")
         self.summary.setText("；".join(counts) + "。灰线=全部片段，红线=等权平均；相似度仅在明细中报告，不作筛选。")
+        reference_plot = self.animal_reference_plots[0]
+        reference_plot.clear()
+        reference = next((group for group in self.output.get("animal_reference_groups", [])
+                          if (group["channel"], group["tag"]) == pair), None)
+        if reference is None:
+            reference_plot.setTitle("AnimalStart 直接对齐对照：选择趋势定位并重新提取后生成")
+        else:
+            for wave in reference["waves"]:
+                reference_plot.plot(reference["time_ms"], wave * scale, pen=pg.mkPen((120, 130, 140, 65), width=.7))
+            reference_plot.plot(reference["time_ms"], reference["mean"] * scale, pen=pg.mkPen("#2679b5", width=2.2))
+            reference_plot.setTitle(f"ch{pair[0]} | Tag {pair[1]} | AnimalStart 直接对齐（未去毛刺的载入波形） | n={len(reference['rows'])}")
+            reference_plot.setLabel("bottom", "相对 AnimalStart", units="ms"); reference_plot.setLabel("left", unit)
+        if self.output["settings"].get("localization_mode", "raw") == "trend":
+            self.summary.setText(self.summary.text() + " 当前用趋势定位、载入波形平均；蓝色趋势线不参与平均。")
         if self.tabs.currentIndex() == 2:
             self.render_details()
 
@@ -406,7 +471,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                         self._detail_conditioned = _condition_channel(self.source, rows[0]["column"], self.output["settings"])
                         self._detail_conditioned_channel = channel
                     t, values = trial_detail_trace(self.source, self.output, rows, self._detail_conditioned)
-                    draw_trial_detail(axis, self.output, rows, t, values)
+                    localization = trial_detail_localization(self.source, self.output, rows)
+                    draw_trial_detail(axis, self.output, rows, t, values, localization, self.detail_curve_box.currentData())
             self.detail_toolbar.update()  # Discard zoom history from the previous page/tag.
             self.detail_canvas.draw_idle()
             self.page_label.setText(f"第 {self._detail_page+1}/{pages} 页 | {len(trials)} 个 trial；红=峰，绿=谷，紫=AnimalStart")

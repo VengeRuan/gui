@@ -15,6 +15,7 @@ import uuid
 import numpy as np
 
 from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
+from animal_peak_localization import localization_config, trial_localization
 
 
 class AnalysisCancelled(Exception):
@@ -139,6 +140,13 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
     settings = dict(settings)
     settings.setdefault("memory_budget_bytes", 256 * 1024 * 1024)
     settings.setdefault("search_after_ms", 0.0)
+    settings.update(localization_config(settings, fs))
+    trend_mode = settings["localization_mode"] == "trend"
+    if trend_mode:
+        # Localization is disposable. Average only the loaded source, never
+        # optional task conditioning, spike replacements or smoothing output.
+        settings["processing"] = {}
+    settings["average_waveform"] = "loaded_source_baseline_corrected" if trend_mode else "legacy_task_conditioned_baseline_corrected"
     for key in ("search_ms", "search_after_ms", "pre_ms", "post_ms", "epoch_start_ms", "epoch_end_ms", "baseline_start_ms", "baseline_end_ms"):
         if not np.isfinite(float(settings[key])):
             raise ValueError(f"参数 {key} 必须为有限数值")
@@ -234,10 +242,11 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
         return {"settings": settings, "groups": [], "records": excluded, "eligible_trials": [],
                 "source_identity": source_identity(source), "source": _source_metadata(meta), "fs": fs,
                 "units": "z" if (settings.get("processing") or {}).get("zscore") else "mV"}
-    estimated = len(channel_ids) * len(eligible) * 2 * (pre + post + 1) * 4
+    estimated = len(channel_ids) * len(eligible) * (3 if trend_mode else 2) * (pre + post + 1) * 4
     if estimated * 2 > settings["memory_budget_bytes"]:
         raise ValueError(f"预计峰谷结果及计算工作区需要约 {estimated*2/1024**2:.0f} MB，超过测试预算。请减少通道/Trial或截取长度。")
     records, groups = list(excluded), []
+    animal_groups, animal_records = [], []
     total = len(channel_ids) * len(eligible)
     completed = 0
     for channel in channel_ids:
@@ -254,6 +263,7 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                 raise ValueError("读取期间数据源已改变，请重新打开测试窗口。")
             return values
         buckets = defaultdict(list)
+        animal_buckets = defaultdict(list)
         for trial in eligible:
             _check(cancel)
             center = trial["marker_sample"] - offset
@@ -272,10 +282,38 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                                 "reason": detail, "reason_code": code})
             else:
                 correction = float(np.mean(finite_base))
-                flat = bool(np.max(search[valid]) == np.min(search[valid]))
-                for branch, extreme in (("peak", np.max(search[valid])), ("trough", np.min(search[valid]))):
+                localization = None
+                locating = search
+                if trend_mode:
+                    localization = trial_localization(read, trial, meta.rows, fs, settings,
+                                                      lambda: _check(cancel), reserved_bytes=estimated * 2)
+                    first_index = trial["search_first"] - localization["first"]
+                    last_index = trial["search_last"] - localization["first"]
+                    locating = localization["trend"][first_index:last_index]
+                    replaced_count = int(localization["despike_mask"][first_index:last_index].sum())
+                    reference_first = trial["animal_local_sample"] - pre
+                    reference_last = trial["animal_local_sample"] + post + 1
+                    reference_row = {**trial, "channel": channel, "column": column,
+                                     "branch": "animal", "baseline_correction": correction,
+                                     "excerpt_first": reference_first, "excerpt_last": reference_last}
+                    if reference_first < 0 or reference_last > meta.rows:
+                        reference_row.update(status="excluded", reason="AnimalStart 对照截取片段超出源数据边界",
+                                             excerpt_first=reference_first, excerpt_last=reference_last)
+                    else:
+                        reference_wave = read(reference_first, reference_last).copy() - correction
+                        reference_wave[~np.isfinite(reference_wave)] = np.nan
+                        reference_row.update(status="included", reason="")
+                        animal_buckets[trial["tag"]].append((reference_row, reference_wave))
+                    animal_records.append(reference_row)
+                locating_valid = np.isfinite(locating) & valid
+                if not locating_valid.any():
+                    records.append({**trial, "channel": channel, "branch": "both", "status": "excluded",
+                                    "reason_code": "localization_no_finite", "reason": "定位趋势线在搜索区没有有效数值"})
+                    continue
+                flat = bool(np.max(locating[locating_valid]) == np.min(locating[locating_valid]))
+                for branch, extreme in (("peak", np.max(locating[locating_valid])), ("trough", np.min(locating[locating_valid]))):
                     _check(cancel)
-                    candidates = np.flatnonzero(valid & (search == extreme))
+                    candidates = np.flatnonzero(locating_valid & (locating == extreme))
                     distance = np.abs(trial["search_first"] + candidates - trial["animal_local_sample"])
                     index = int(candidates[distance == distance.min()][-1])
                     position = trial["search_first"] + index
@@ -291,10 +329,22 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                            "extreme_local_sample": position, "extreme_sample": position + offset,
                            "extreme_sec": (position + offset) / fs,
                            "extreme_relative_ms": (position - trial["animal_local_sample"]) / fs * 1000,
-                           "amplitude": float(extreme - correction), "baseline_correction": correction,
+                           "amplitude": float(search[index] - correction), "baseline_correction": correction,
+                           "localization_mode": settings["localization_mode"],
+                           "localization_amplitude": float(extreme - correction),
                            "excerpt_first": left, "excerpt_last": right,
                            "crosses_animal_start": right > trial["animal_local_sample"],
                            "flags": "; ".join(flags), "similarity_r": np.nan}
+                    if trend_mode:
+                        raw_extreme = np.max(search[valid]) if branch == "peak" else np.min(search[valid])
+                        raw_candidates = np.flatnonzero(valid & (search == raw_extreme))
+                        raw_distances = np.abs(trial["search_first"] + raw_candidates - trial["animal_local_sample"])
+                        raw_index = int(raw_candidates[raw_distances == raw_distances.min()][-1])
+                        row.update(despike_count_search=replaced_count,
+                                   localization_context_first=localization["first"], localization_context_last=localization["last"],
+                                   despike_window_samples=settings["despike_window_samples"], trend_window_samples=settings["trend_window_samples"],
+                                   raw_extreme_relative_ms=(trial["search_first"] + raw_index - trial["animal_local_sample"]) / fs * 1000,
+                                   raw_extreme_amplitude=float(raw_extreme - correction))
                     if left < 0:
                         row.update(status="excluded", reason_code="excerpt_before_data",
                                    reason=f"完整截取片段超出源数据边界：截取起点早于数据起点；片段本地样本范围=[{left}, {right})，数据范围=[0, {meta.rows})，仅排除本峰谷分支的平均")
@@ -320,9 +370,17 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                            "time_ms": np.arange(-pre, post + 1, dtype=float) / fs * 1000,
                            "waves": waves, "mean": mean, "sem": sem, "valid_count": count,
                            "rows": [entry[0] for entry in entries]})
-        del conditioned, buckets
+        for tag, entries in sorted(animal_buckets.items()):
+            waves = np.stack([entry[1] for entry in entries])
+            mean, sem, count, _ = _summarize(waves, cancel)
+            animal_groups.append({"channel": channel, "tag": tag, "branch": "animal",
+                                  "time_ms": np.arange(-pre, post + 1, dtype=float) / fs * 1000,
+                                  "waves": waves, "mean": mean, "sem": sem, "valid_count": count,
+                                  "rows": [entry[0] for entry in entries]})
+        del conditioned, buckets, animal_buckets
     _check(cancel)
     return {"settings": settings, "groups": groups, "records": records, "eligible_trials": eligible,
+            "animal_reference_groups": animal_groups, "animal_reference_records": animal_records,
             "source_identity": source_identity(source), "source": _source_metadata(meta), "fs": fs,
             "units": "z" if (settings.get("processing") or {}).get("zscore") else "mV"}
 
@@ -347,6 +405,29 @@ def trial_detail_trace(source, output, rows, conditioned=None):
         raise ValueError("详情读取期间数据源已改变，请重新计算。")
     time_ms = (np.arange(first, last) - rows[0]["animal_local_sample"]) / output["fs"] * 1000
     return time_ms, values
+
+
+def trial_detail_localization(source, output, rows, cancel=None):
+    """Reproduce the exact padded locator used for selection, not a new zoom."""
+    if output["settings"].get("localization_mode", "raw") != "trend":
+        return None
+    if source_identity(source) != output["source_identity"]:
+        raise ValueError("原数据源已改变，请重新计算定位结果。")
+    row = rows[0]
+    localization = trial_localization(
+        lambda first, last: _read(source, row["column"], first, last), row,
+        source.metadata.rows, output["fs"], output["settings"], lambda: _check(cancel),
+    )
+    if source_identity(source) != output["source_identity"]:
+        raise ValueError("定位曲线读取期间数据源已改变，请重新计算。")
+    first = max(0, min(min(item["search_first"], item["excerpt_first"]) for item in rows))
+    last = min(source.metadata.rows, max(max(item["search_last"], item["excerpt_last"]) for item in rows))
+    start, stop = first - localization["first"], last - localization["first"]
+    correction = row["baseline_correction"]
+    return {"time_ms": (np.arange(first, last) - row["animal_local_sample"]) / output["fs"] * 1000,
+            "despiked": localization["despiked"][start:stop] - correction,
+            "trend": localization["trend"][start:stop] - correction,
+            "despike_mask": localization["despike_mask"][start:stop]}
 
 
 def _json_safe(value):
@@ -394,9 +475,16 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
         writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
         writer.writerows(records)
+    if output.get("animal_reference_records"):
+        reference_records = output["animal_reference_records"]
+        with (folder / "animalstart_reference_details.csv").open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=sorted({key for row in reference_records for key in row}))
+            writer.writeheader(); writer.writerows(reference_records)
     pairs = defaultdict(dict)
     for group in output["groups"]:
         pairs[(group["channel"], group["tag"])][group["branch"]] = group
+    for group in output.get("animal_reference_groups", []):
+        pairs.setdefault((group["channel"], group["tag"]), {})
     detail_sets = defaultdict(list)
     for row in records:
         if "extreme_local_sample" in row:
@@ -423,6 +511,8 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                 f"原 Letter Epoch：{configuration['epoch_start_ms']:g}～{configuration['epoch_end_ms']:g} ms",
                 f"原 Letter 基线：{configuration['baseline_start_ms']:g}～{configuration['baseline_end_ms']:g} ms",
                 f"AnimalStart 前/后搜索：{configuration['search_ms']:g}/{configuration.get('search_after_ms', 0):g} ms | 极值前/后截取：{configuration['pre_ms']:g}/{configuration['post_ms']:g} ms",
+                (f"定位方式：去毛刺＋趋势线；去毛刺窗={configuration.get('despike_window_ms')} ms，MAD={configuration.get('despike_mad_threshold')}，平滑窗={configuration.get('trend_window_ms')} ms；只定位，平均载入波形。"
+                 if configuration.get("localization_mode") == "trend" else "定位方式：原波形极值（旧方式）"),
                 f"有效 AnimalStart Trial：{len(output['eligible_trials'])} | 峰谷纳入记录：{sum(r['status']=='included' for r in records)}",
                 "每个有效 trial 都选最大值和最小值；同值取更接近 AnimalStart 的采样点，等距离取较晚点。",
                 "正负分支独立平均，不反转、不归一化；相似度仅报告，不筛选。",
@@ -467,6 +557,26 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                                         extrema_relative_ms=np.asarray(latency),
                                         similarity_r=np.asarray([row["similarity_r"] for row in group["rows"]]),
                                         units=output["units"], channel=channel, tag=tag)
+                reference = next((item for item in output.get("animal_reference_groups", [])
+                                  if item["channel"] == channel and item["tag"] == tag), None)
+                if reference is not None:
+                    ref_fig = Figure(figsize=(10, 5), layout="constrained"); FigureCanvasAgg(ref_fig)
+                    ref_axis = ref_fig.subplots()
+                    ref_axis.plot(reference["time_ms"], reference["waves"].T * scale, color=".6", alpha=.22, linewidth=.5)
+                    ref_axis.plot(reference["time_ms"], reference["mean"] * scale, color="#2679b5", label="未去毛刺的载入波形等权平均")
+                    ref_axis.fill_between(reference["time_ms"], (reference["mean"] - reference["sem"]) * scale,
+                                          (reference["mean"] + reference["sem"]) * scale, color="#2679b5", alpha=.15, label="±SEM")
+                    ref_axis.axvline(0, color="#9467bd", linestyle="--")
+                    ref_axis.set(title=f"ch{channel} | Tag {tag} | AnimalStart 直接对齐对照 | n={len(reference['rows'])}",
+                                 xlabel="相对 AnimalStart（ms）", ylabel=unit)
+                    ref_axis.legend(); ref_axis.grid(alpha=.15)
+                    ref_name = f"ch{channel}_tag{tag}_animalstart_reference"
+                    ref_fig.savefig(folder / (ref_name + ".png"), dpi=220)
+                    ref_fig.savefig(folder / (ref_name + ".pdf")); pdf.savefig(ref_fig); ref_fig.clear()
+                    np.savez_compressed(folder / (ref_name + ".npz"), time_ms=reference["time_ms"],
+                                        trials=reference["waves"], mean=reference["mean"], sem=reference["sem"],
+                                        valid_count=reference["valid_count"], units=output["units"], channel=channel, tag=tag,
+                                        trial_ids=np.asarray([row["trial_id"] for row in reference["rows"]]))
                 fig.savefig(folder / f"ch{channel}_tag{tag}_summary.png", dpi=220)
                 fig.savefig(folder / f"ch{channel}_tag{tag}_summary.pdf")
                 pdf.savefig(fig); fig.clear()
@@ -489,13 +599,15 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                     return
                 trace_parts[trace_pair] += 1
                 offsets = np.r_[0, np.cumsum([item[2].size for item in numeric_traces])]
-                np.savez_compressed(
-                    folder / f"ch{trace_pair[0]}_tag{trace_pair[1]}_trial_traces_part{trace_parts[trace_pair]:03d}.npz",
-                    time_ms=np.concatenate([item[1] for item in numeric_traces]),
-                    values=np.concatenate([item[2] for item in numeric_traces]), offsets=offsets,
-                    trial_ids=np.asarray([item[0] for item in numeric_traces]), units=output["units"],
-                    channel=trace_pair[0], tag=trace_pair[1],
-                )
+                payload = dict(time_ms=np.concatenate([item[1] for item in numeric_traces]),
+                               values=np.concatenate([item[2] for item in numeric_traces]), offsets=offsets,
+                               trial_ids=np.asarray([item[0] for item in numeric_traces]), units=output["units"],
+                               channel=trace_pair[0], tag=trace_pair[1])
+                if numeric_traces[0][3] is not None:
+                    payload.update(trend_values=np.concatenate([item[3]["trend"] for item in numeric_traces]),
+                                   despiked_values=np.concatenate([item[3]["despiked"] for item in numeric_traces]),
+                                   despike_mask=np.concatenate([item[3]["despike_mask"] for item in numeric_traces]))
+                np.savez_compressed(folder / f"ch{trace_pair[0]}_tag{trace_pair[1]}_trial_traces_part{trace_parts[trace_pair]:03d}.npz", **payload)
                 numeric_traces = []; numeric_bytes = 0
 
             for detail_index, ((channel, tag, trial_id), rows) in enumerate(sorted(detail_sets.items())):
@@ -506,8 +618,11 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                     conditioned = _condition_channel(source, rows[0]["column"], output["settings"], cancel)
                     previous_channel = channel
                 time_ms, values = trial_detail_trace(source, output, rows, conditioned)
-                numeric_traces.append((trial_id, time_ms.astype(np.float32), values))
+                localization = trial_detail_localization(source, output, rows, cancel)
+                numeric_traces.append((trial_id, time_ms.astype(np.float32), values, localization))
                 numeric_bytes += time_ms.size * 4 + values.nbytes
+                if localization is not None:
+                    numeric_bytes += sum(localization[key].nbytes for key in ("time_ms", "despiked", "trend", "despike_mask"))
                 if numeric_bytes >= 16 * 1024 * 1024:
                     save_trace_part()
                 if page_index == 0:
@@ -515,11 +630,11 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                     axes = page.subplots(2, 2).ravel()
                     page.suptitle(f"{Path(output['source']['path']).name} | 逐 Trial 找波与截取详情", fontsize=12)
 
-                draw_trial_detail(axes[page_index], output, rows, time_ms, values)
+                draw_trial_detail(axes[page_index], output, rows, time_ms, values, localization)
                 if individual_png:
                     single = Figure(figsize=(10, 5), layout="constrained"); FigureCanvasAgg(single)
                     single.suptitle(Path(output["source"]["path"]).name, fontsize=10)
-                    draw_trial_detail(single.subplots(), output, rows, time_ms, values)
+                    draw_trial_detail(single.subplots(), output, rows, time_ms, values, localization)
                     single.savefig(folder / f"ch{channel}_tag{tag}_trial{trial_id:05d}_detail.png", dpi=220)
                     single.clear()
                 page_index += 1

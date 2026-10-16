@@ -18,6 +18,7 @@ from animal_peak_dialog import AnimalPeakDialog, QtCore, QtWidgets
 from animal_peak_analysis import analyze_animal_peaks, trial_detail_trace
 from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
 from test_animal_peak_analysis import fixture
+from test_animal_peak_localization import trend_fixture
 
 
 class AnimalPeakDialogTests(unittest.TestCase):
@@ -203,6 +204,75 @@ class AnimalPeakDialogTests(unittest.TestCase):
         self.assertEqual(reason.toolTip(), reason.text())
         self.assertEqual(self.dialog.table.item(index, 12).text(), "N")
         self.assertEqual(self.dialog.table.item(index, 18).text(), "validity_not_y")
+
+    def test_trend_controls_and_display_switch_do_not_change_raw_average(self):
+        source, markers, matches, defaults = trend_fixture()
+        self.dialog.deleteLater(); self.app.processEvents()
+        self.dialog = AnimalPeakDialog(self.window, source, markers, matches, defaults)
+        self.assertEqual(self.dialog.localization_box.currentData(), "raw")
+        self.assertFalse(self.dialog.trend_spin.isEnabled())
+        self.dialog.localization_box.setCurrentIndex(1)
+        self.dialog.despike_spin.setValue(9); self.dialog.trend_spin.setValue(31)
+        self.assertFalse(self.dialog.processing_check.isEnabled())
+        self.assertTrue(self.dialog.trend_spin.isEnabled())
+        self.dialog.start_analysis(); self.wait_for_worker()
+        self.assertTrue(self.dialog.export_button.isEnabled())
+        self.assertEqual(self.dialog.output["settings"]["localization_mode"], "trend")
+        self.assertEqual(self.dialog.output["settings"]["processing"], {})
+        means = [group["mean"].copy() for group in self.dialog.output["groups"]]
+        self.dialog.tabs.setCurrentIndex(2); self.app.processEvents()
+        self.assertTrue(self.dialog.detail_curve_box.isEnabled())
+        labels = self.dialog.detail_axes[0].get_legend_handles_labels()[1]
+        self.assertIn("定位趋势线（不用于平均）", labels)
+        self.assertIn("载入波形（参与平均）", labels)
+        self.dialog.detail_curve_box.setCurrentIndex(2); self.app.processEvents()
+        labels = self.dialog.detail_axes[0].get_legend_handles_labels()[1]
+        self.assertNotIn("载入波形（参与平均）", labels)
+        self.assertTrue(self.dialog.export_button.isEnabled())  # Viewing is not a parameter edit.
+        for group, previous in zip(self.dialog.output["groups"], means):
+            np.testing.assert_array_equal(group["mean"], previous)
+        reference = self.dialog.animal_reference_plots[0]
+        self.assertTrue(reference.listDataItems())
+        self.dialog.mad_spin.setValue(7)
+        self.assertFalse(self.dialog.export_button.isEnabled())
+
+    def test_switching_back_to_old_mode_restores_legacy_controls(self):
+        self.dialog.localization_box.setCurrentIndex(1)
+        self.assertFalse(self.dialog.processing_check.isEnabled())
+        self.dialog.localization_box.setCurrentIndex(0)
+        self.assertTrue(self.dialog.processing_check.isEnabled())
+        self.assertFalse(self.dialog.despike_spin.isEnabled())
+        self.assertFalse(self.dialog.trend_spin.isEnabled())
+
+    def test_main_gui_button_runs_new_trend_mode_end_to_end(self):
+        source, markers, matches, _ = trend_fixture()
+        window = self.window
+        window.lfp_source = source
+        window.stim_markers = markers
+        window.stim_marker_mode = "Letter"
+        window.behavior_matches = matches
+        window.epoch_start_ms_var.setText("-500")
+        window.epoch_end_ms_var.setText("2000")
+        window.baseline_start_ms_var.setText("-200")
+        window.baseline_end_ms_var.setText("0")
+        with patch.object(window, "_task_analysis_channel_ids", return_value={7}):
+            window.lfp_animal_peak_test_button.click()
+        opened = window._animal_peak_test_dialog
+        self.dialog.deleteLater(); self.app.processEvents(); self.dialog = opened
+        self.assertIs(opened.source, source)
+        opened.localization_box.setCurrentIndex(1)
+        opened.search_after_spin.setValue(200)
+        opened.despike_spin.setValue(9)
+        opened.trend_spin.setValue(31)
+        opened.post_spin.setValue(150)
+        opened.start_analysis(); self.wait_for_worker()
+        self.assertEqual(opened.output["settings"]["localization_mode"], "trend")
+        self.assertEqual(len(opened.output["eligible_trials"]), 2)
+        peak = next(group for group in opened.output["groups"] if group["branch"] == "peak")
+        self.assertLessEqual(abs(peak["rows"][0]["extreme_relative_ms"] + 120), 3)
+        self.assertGreater(peak["mean"].max(), 15)
+        self.assertTrue(opened.export_button.isEnabled())
+        self.assertIsNone(window._animal_peak_test_worker)
 
 
 if __name__ == "__main__":
