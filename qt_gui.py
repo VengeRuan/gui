@@ -49,6 +49,7 @@ except ImportError:
 
 os.environ["PYQTGRAPH_QT_LIB"] = QT_BINDING
 import pyqtgraph as pg
+from animal_peak_plotting import draw_tag100_interval
 
 Qt = QtCore.Qt
 QRectF, QObject, pyqtSignal, QThread, QTimer = (
@@ -10205,7 +10206,10 @@ class QtAnalysisGUI(QMainWindow):
                 log_path, float(self.bin_timing_metadata.get("deltaT1_sec", 0.0) or 0.0)
             )
             task_mode = self.alignment_task_mode_var.currentText()
-            markers = build_task_markers(event_path, timing, meta.fs, task_mode)
+            letter_annotations = {}
+            markers = build_task_markers(event_path, timing, meta.fs, task_mode,
+                                         letter_annotations=letter_annotations)
+            self.letter_csv_annotations = letter_annotations
             self.timing_info = timing
             self.stim_markers = markers
             self.stim_marker_mode = task_mode
@@ -10230,7 +10234,8 @@ class QtAnalysisGUI(QMainWindow):
             if task_mode == "Letter" and detection_path:
                 frame_rate, recording_time, events = read_behavior_detection_results(detection_path)
                 behavior_matches = match_behavior_events_to_markers(
-                    markers, meta.fs, frame_rate, recording_time, np.nan, events
+                    markers, meta.fs, frame_rate, recording_time, np.nan, events,
+                    letter_annotations=letter_annotations,
                 )
                 self.behavior_matches = behavior_matches
                 self.behavior_detection_path = Path(detection_path)
@@ -10254,6 +10259,10 @@ class QtAnalysisGUI(QMainWindow):
                     f"StartFrame 相对 marker={first['visual_start_latency_sec'] * 1000.0:+.3f} ms\n"
                     "说明：StartFrame 仅用于视觉对齐检查；有效 AnimalStart 仅作为行为参考。"
                 )
+            cue_errors = [f"CSV第{cue['tag100_csv_row']}行：{cue['tag100_message']}"
+                          for cue in letter_annotations.values() if cue["tag100_status"] != "csv"]
+            cue_text = (f"\nTag100黑区：CSV同行M列起点，固定持续2 s；{len(cue_errors)} 条提示。"
+                        + ("\n" + "\n".join(cue_errors) if cue_errors else "")) if task_mode == "Letter" else ""
             self.alignment_results.setPlainText(
                 f"{task_mode} 对齐完成\nRecording ON: {timing['rec_start_text']}\n"
                 f"PROGRAM_START: {timing['stim_start_text']}\n"
@@ -10262,7 +10271,7 @@ class QtAnalysisGUI(QMainWindow):
                 f"校正后刺激延迟：{timing['stim_delay_sec']:.6f} s\n"
                 f"标记：{markers.shape[0]} 个；记录范围内：{valid.shape[0]} 个；"
                 f"视频检测匹配：{len(behavior_matches)} 个\n"
-                + behavior_text + "\n\n"
+                + behavior_text + cue_text + "\n\n"
                 + "前十个 [sample, tag]：\n" + np.array2string(markers[:10], separator=", ")
             )
             self._sync_preview_channel_box(
@@ -10280,6 +10289,11 @@ class QtAnalysisGUI(QMainWindow):
             )
             self._inherit_alignment_selection_for_lfp()
             self._update_file_banners()
+            if cue_errors:
+                QMessageBox.warning(self, "CSV Dot 提示时间异常（不影响trial分析）",
+                                    "\n".join(cue_errors[:20])
+                                    + (f"\n另有 {len(cue_errors)-20} 条，详见对齐结果。" if len(cue_errors)>20 else "")
+                                    + "\n这些trial不画Tag100黑区；不使用TXT替代，不排除trial。")
         except Exception as exc:
             self.alignment_status.setText(f"时间对齐失败：{exc}")
             QMessageBox.critical(self, "时间对齐失败", str(exc))
@@ -11730,20 +11744,49 @@ class QtAnalysisGUI(QMainWindow):
         self._update_lfp_progress(0, "正在计算任务-静息时频图…")
         worker.start()
 
+    def _animal_peak_alignment_context(self):
+        """Use the source and channel scope actually used by page 3, not page 4."""
+        snapshot = getattr(self, "_task_marker_source", None)
+        if not snapshot or not snapshot.get("selected_channel_ids"):
+            raise ValueError("请先在第三页选择健康通道，并点击“计算并刷新对齐”；测试通道以这次完成的对齐为准。")
+        source = self.active_source
+        if source is None or not source.loaded:
+            raise ValueError("时间对齐的数据源尚未加载，请重新导入并计算对齐。")
+        meta = source.metadata
+        if (Path(str(snapshot["source_path"])).resolve() != Path(str(meta.path)).resolve()
+                or float(snapshot["fs"]) != float(meta.fs)
+                or float(snapshot["time_offset_sec"]) != float(meta.time_offset)):
+            raise ValueError("当前数据源与上次时间对齐的数据源不一致，请在第三页重新计算并刷新对齐。")
+        selected_ids = sorted({int(channel) for channel in snapshot["selected_channel_ids"]})
+        healthy = self._alignment_healthy_channel_ids(source)
+        unavailable = sorted(set(selected_ids) - healthy)
+        if unavailable:
+            raise ValueError("上次对齐的这些通道已不存在或不再属于健康通道："
+                             + ",".join(map(str, unavailable)) + "。请在第三页重新选择并计算对齐。")
+        context_key = (id(source), id(self.stim_markers), id(self.behavior_matches), tuple(selected_ids))
+        return source, selected_ids, context_key
+
     def open_animal_peak_test(self) -> None:
         """Open an independent experiment without modifying task parameters/results."""
-        source = self.lfp_source or self.active_source
-        if not source.loaded or not hasattr(self, "stim_markers") or getattr(self, "stim_marker_mode", None) != "Letter":
+        if not hasattr(self, "stim_markers") or getattr(self, "stim_marker_mode", None) != "Letter":
             QMessageBox.information(self, "需要 Letter 对齐", "请先加载 LFP 数据，并在时间对齐页生成 Letter markers。")
             return
         matches = getattr(self, "behavior_matches", {})
         if not matches:
             QMessageBox.information(self, "缺少 AnimalStart 信息", "请在时间对齐页导入对应行为检测结果并计算对齐，获得 AnimalStart 时间。")
             return
+        try:
+            source, selected_ids, context_key = self._animal_peak_alignment_context()
+        except ValueError as exc:
+            QMessageBox.warning(self, "需要更新对齐", str(exc))
+            return
         existing = getattr(self, "_animal_peak_test_dialog", None)
         if existing is not None:
             try:
                 if existing.isVisible():
+                    if getattr(existing, "_alignment_context_key", None) != context_key:
+                        QMessageBox.information(self, "对齐已更新", "第三页的对齐数据或通道已更新。请先保存并关闭原测试窗口，再重新打开，以免丢失已有结果或人工点位。")
+                        return
                     if existing.isMinimized():
                         existing.showNormal()
                     existing.raise_(); existing.activateWindow(); return
@@ -11751,9 +11794,6 @@ class QtAnalysisGUI(QMainWindow):
                 pass
         try:
             get = lambda name, default: float(self._widget_text(getattr(self, name), str(default)) or default)
-            selected_ids = sorted(self._task_analysis_channel_ids(source))
-            if not selected_ids:
-                raise ValueError("请先选择用于测试的 LFP 通道。")
             tags = [int(value.strip()) for value in self._widget_text(self.stimtag_var, "").replace(";", ",").split(",") if value.strip()]
             n_types = max(0, int(get("n_stim_types_var", 0)))
             available = sorted({int(tag) for _sample, tag in self.stim_markers if int(tag) in (4, 5, 6, 7)})
@@ -11762,6 +11802,7 @@ class QtAnalysisGUI(QMainWindow):
                 tags = tags[:n_types]
             defaults = {
                 "channel_ids": selected_ids, "tags": tags,
+                "channel_selection_source": "completed_alignment",
                 "epoch_start_ms": get("epoch_start_ms_var", -500), "epoch_end_ms": get("epoch_end_ms_var", 6000),
                 "baseline_start_ms": get("baseline_start_ms_var", -200), "baseline_end_ms": get("baseline_end_ms_var", 0),
                 "trial_limit": 0,  # Experimental peak test defaults to every trial, independently of Letter A/B.
@@ -11774,6 +11815,7 @@ class QtAnalysisGUI(QMainWindow):
             }
             from animal_peak_dialog import AnimalPeakDialog
             dialog = AnimalPeakDialog(self, source, self.stim_markers, matches, defaults)
+            dialog._alignment_context_key = context_key
             dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
             self._animal_peak_test_dialog = dialog
             dialog.show()
@@ -12798,7 +12840,7 @@ class QtAnalysisGUI(QMainWindow):
             return
         window = QMainWindow(self); window.setWindowTitle(f"ch{ids[channel_index]} 单 trial - tag {result['tag']}"); window.resize(1350, 900)
         root = QWidget(); layout = QVBoxLayout(root); window.setCentralWidget(root)
-        layout.addWidget(QLabel("每格一个 trial：红=Letter onset，绿=StartFrame，橙=EndFrame，紫=有效 AnimalStart。"))
+        layout.addWidget(QLabel("每格一个 trial：红=Letter onset，绿=StartFrame，橙=EndFrame，紫=有效 AnimalStart；半透明黑区=CSV同行M列Dot开始后的2秒。"))
         pager = QHBoxLayout(); previous = QPushButton("上一页"); following = QPushButton("下一页"); page_label = QLabel()
         pager.addWidget(previous); pager.addWidget(following); pager.addWidget(page_label); pager.addStretch(1); layout.addLayout(pager)
         holder = QWidget(window); grid = QGridLayout(holder); grid.setContentsMargins(0, 0, 0, 0); grid.setSpacing(5); layout.addWidget(holder, 1)
@@ -12819,12 +12861,15 @@ class QtAnalysisGUI(QMainWindow):
             for local, index in enumerate(range(first, last)):
                 plot = plots[local]; plot.clear(); axis = plot.add_subplot(111)
                 axis.plot(t_sec, trials[index], color="#111111", linewidth=.7); axis.axvline(0, color="#d62728", linestyle="--", linewidth=1.1)
-                event = matches.get(samples[index], {})
+                event = {**matches.get(samples[index], {}),
+                         **getattr(self, "letter_csv_annotations", {}).get(samples[index], {})}
                 visual = float(event.get("visual_start_latency_sec", np.nan)); end_latency = float(event.get("end_latency_sec", np.nan)); animal = float(event.get("animal_latency_sec", np.nan))
                 if np.isfinite(visual): axis.axvline(visual, color="#2ca02c", linewidth=1.0)
                 if np.isfinite(end_latency): axis.axvline(end_latency, color="#ff7f0e", linestyle="--", linewidth=1.0)
                 if event.get("validity") == "Y" and np.isfinite(animal): axis.axvline(animal, color="#9467bd", linewidth=1.1)
-                axis.set_title(f"trial {index + 1}"); axis.set_xlabel("s"); axis.set_ylabel("幅值(μV)"); axis.grid(alpha=.2); plot.show()
+                draw_tag100_interval(axis, event, (float(t_sec[0]), float(t_sec[-1])))
+                cue_warning = event.get("tag100_message", "") if event.get("tag100_status") not in {None, "csv"} else ""
+                axis.set_title(f"trial {index + 1}" + (f"\n{cue_warning}" if cue_warning else "")); axis.set_xlabel("s"); axis.set_ylabel("幅值(μV)"); axis.grid(alpha=.2); plot.show()
             page_label.setText(f"第 {state['page'] + 1}/{total_pages} 页，trial {first + 1}-{last}/{trials.shape[0]}")
             previous.setEnabled(state["page"] > 0); following.setEnabled(state["page"] < total_pages - 1)
             holder.setUpdatesEnabled(True)
@@ -12848,13 +12893,18 @@ class QtAnalysisGUI(QMainWindow):
         elif np.std(finite) <= 50: verdict = f"对齐检查：稳定但有系统偏移，约 {np.mean(finite):+.1f} ms。"
         else: verdict = f"对齐检查：需检查抖动，StartFrame 的 SD 为 {np.std(finite):.1f} ms。"
         layout.addWidget(QLabel(f"帧率：{frame_rate:g} Hz | Letter markers：{len(markers)} | 已匹配：{matched_count}\nStartFrame 相对 Letter marker：n={finite.size}，均值={np.mean(finite) if finite.size else np.nan:.2f} ms，SD={np.std(finite) if finite.size else np.nan:.2f} ms\n{verdict}"))
-        table = QTableWidget(len(markers), 11, window); table.setHorizontalHeaderLabels(["全局 trial", "tag 内 trial", "tag", "marker sample", "marker s", "StartFrame", "StartFrame 偏移 ms", "EndFrame", "EndFrame 延迟 ms", "有效性", "AnimalStart 延迟 ms"])
+        table = QTableWidget(len(markers), 17, window); table.setHorizontalHeaderLabels(["全局 trial", "tag 内 trial", "tag", "marker sample", "marker s", "StartFrame", "StartFrame 偏移 ms", "EndFrame", "EndFrame 延迟 ms", "有效性", "AnimalStart 延迟 ms", "Dot CSV M列 s", "Dot 持续 s", "Tag100 起点相对Letter ms", "Tag100 终点相对Letter ms", "Tag100 状态/提示", "Tag100 CSV行号"])
         table.setUpdatesEnabled(False)
         table.setSortingEnabled(False)
         tag_trials = {}
         for row_index, marker in enumerate(markers):
             sample, tag = int(marker[0]), int(marker[1]); tag_trials[tag] = tag_trials.get(tag, 0) + 1; event = matches.get(sample, {})
             values = [row_index + 1, tag_trials[tag], tag, sample, f"{sample / float(output.get('fs', self.active_source.metadata.fs)):.6f}", event.get("start_frame", "NA"), f"{float(event.get('visual_start_latency_sec', np.nan)) * 1000:.3f}", event.get("end_frame", "NA"), f"{float(event.get('end_latency_sec', np.nan)) * 1000:.3f}", event.get("validity", "unmatched"), f"{float(event.get('animal_latency_sec', np.nan)) * 1000:.3f}"]
+            event = {**event, **getattr(self, "letter_csv_annotations", {}).get(sample, {})}
+            values.extend([event.get("tag100_dot_offset_sec", ""), event.get("tag100_duration_sec", ""),
+                           f"{float(event.get('tag100_start_latency_sec', np.nan))*1000:.3f}",
+                           f"{float(event.get('tag100_end_latency_sec', np.nan))*1000:.3f}",
+                           event.get("tag100_message", "需重新计算对齐"), event.get("tag100_csv_row", "")])
             for column, value in enumerate(values): table.setItem(row_index, column, QTableWidgetItem(str(value)))
         table.resizeColumnsToContents(); table.setUpdatesEnabled(True); layout.addWidget(table, 1)
         window.show(); self._letter_timing_window = window
@@ -18155,7 +18205,7 @@ class QtAnalysisGUI(QMainWindow):
             self.spike_rows = []
             self._task_marker_source = None
             for name in (
-                "stim_markers", "stim_marker_mode", "timing_info",
+                "stim_markers", "stim_marker_mode", "timing_info", "letter_csv_annotations",
                 "behavior_matches", "behavior_detection_path",
                 "behavior_detection_events", "behavior_detection_frame_rate",
                 "behavior_detection_recording_time_sec", "behavior_detection_video_eeg_offset_sec",

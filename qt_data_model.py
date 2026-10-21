@@ -1092,8 +1092,10 @@ def _normalize_letter_stim_mode(value) -> str:
     return compact.lower()
 
 
-def build_task_markers(path: str | Path, timing: dict, fs: float, mode: str = "Flash") -> np.ndarray:
+def build_task_markers(path: str | Path, timing: dict, fs: float, mode: str = "Flash", *, letter_annotations=None) -> np.ndarray:
     """Port of the old Flash/Letter Event-CSV marker builder."""
+    if letter_annotations is not None:
+        letter_annotations.clear()
     normalized = str(mode).strip().lower()
     if normalized == "flash":
         return build_flash_markers(path, timing, fs)
@@ -1115,12 +1117,38 @@ def build_task_markers(path: str | Path, timing: dict, fs: float, mode: str = "F
     tag_map = {"o": 6, "|": 4, "-": 7, "闪烁光点": 5}
     delay_sec = float(timing["stim_delay_sec"])
     samples, tags = [], []
-    for mode_text, offset_sec in zip(stim_mode, letter_offset_sec):
+    for csv_row, (mode_text, offset_sec, dot_sec) in enumerate(zip(stim_mode, letter_offset_sec, dot_offset_sec), start=2):
         if not np.isfinite(offset_sec):
             continue
         key = _normalize_letter_stim_mode(mode_text)
-        samples.append(round(float(fs) * (delay_sec + float(offset_sec))))
-        tags.append(tag_map.get(key, 100))
+        sample = round(float(fs) * (delay_sec + float(offset_sec)))
+        tag = tag_map.get(key, 100)
+        samples.append(sample)
+        tags.append(tag)
+        if letter_annotations is not None and tag in {4, 5, 6, 7}:
+            # Display-only metadata, bound to the SAME CSV row as this Letter.
+            # Keep exact CSV seconds; only the existing Letter marker is rounded.
+            cue = {
+                "tag100_source": "csv", "tag100_csv_path": str(Path(path).resolve()),
+                "tag100_csv_row": csv_row, "tag100_dot_offset_sec": float(dot_sec),
+                "tag100_letter_offset_sec": float(offset_sec), "tag100_duration_sec": 2.0,
+                "tag100_status": "csv", "tag100_message": "CSV M列，持续2 s",
+            }
+            if not np.isfinite(dot_sec) or dot_sec < 0:
+                cue.update(tag100_status="invalid_csv_dot",
+                           tag100_message="CSV Dot 时间缺失或无效（M列）；不画黑区")
+            else:
+                start_sec = delay_sec + float(dot_sec)
+                cue.update(tag100_start_eeg_sec=start_sec, tag100_end_eeg_sec=start_sec + 2.0,
+                           tag100_start_latency_sec=start_sec - sample / float(fs),
+                           tag100_end_latency_sec=start_sec + 2.0 - sample / float(fs))
+            if sample in letter_annotations:
+                # A shared sample cannot unambiguously identify two CSV rows.
+                previous = letter_annotations[sample]
+                cue.update(tag100_status="ambiguous_csv_row",
+                           tag100_csv_row=f"{previous['tag100_csv_row']},{csv_row}",
+                           tag100_message="多个CSV行对应同一Letter采样点；不画黑区")
+            letter_annotations[sample] = cue
     for offset_sec in dot_offset_sec:
         if np.isfinite(offset_sec):
             samples.append(round(float(fs) * (delay_sec + float(offset_sec))))
@@ -1182,9 +1210,9 @@ def read_behavior_detection_results(path: str | Path) -> tuple[float, float, lis
 
 def match_behavior_events_to_markers(
     markers, fs: float, frame_rate: float, video_recording_time_sec: float,
-    eeg_recording_time_sec: float, detection_events: list[dict],
+    eeg_recording_time_sec: float, detection_events: list[dict], *, letter_annotations=None,
 ) -> dict[int, dict]:
-    """Exact port of IntegratedPipelineGUI's first-Letter-trial matching.
+    """Established first-Letter-trial matching with display-only cue metadata.
 
     The recording-time arguments are retained for interface parity with the
     established implementation.  Its calibration is deliberately based on
@@ -1263,6 +1291,8 @@ def match_behavior_events_to_markers(
             "video_eeg_offset_sec": video_eeg_offset_sec,
             "alignment_basis": "first_letter_trial",
         }
+        if letter_annotations is not None:
+            matched[sample].update(letter_annotations.get(sample, {}))
     return matched
 
 

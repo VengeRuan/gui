@@ -14,8 +14,9 @@ import uuid
 
 import numpy as np
 
-from animal_peak_plotting import PLOT_STYLE, draw_trial_detail
+from animal_peak_plotting import PLOT_STYLE, draw_trial_detail, judgment_info, apply_waveform_y_limits, waveform_y_limits, waveform_display, letter_display_before_ms
 from animal_peak_localization import localization_config, trial_localization
+from animal_peak_trial_selection import selected_average_group
 
 
 class AnalysisCancelled(Exception):
@@ -129,7 +130,9 @@ def _animal_exclusion(event, latency):
 def analyze_animal_peaks(source, markers, matches, settings, progress=None, cancel=None):
     """Find one maximum AND minimum around AnimalStart in each eligible trial.
 
-    Eligibility is tied to the existing Letter epoch. Excerpts may extend
+    Eligibility is tied to the existing Letter epoch. A requested search
+    start before that epoch is clipped to its start instead of rejecting
+    the Trial. Excerpts may extend
     beyond that epoch (including beyond AnimalStart), but never beyond source
     bounds. Extremum ties choose the point nearest AnimalStart, then latest.
     """
@@ -204,6 +207,8 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
             "validity", "start_frame", "animal_start_frame", "animal_start_raw", "animal_start_status",
             "validity_raw", "detection_line_number",
         )})
+        if event is not None:
+            row.update({name: value for name, value in event.items() if name.startswith("tag100_")})
         epoch_range = f"Epoch=[{epoch_first / fs * 1000:g}, {epoch_last / fs * 1000:g}) ms（相对 Letter）"
         if event is None:
             reason_code = "behavior_unmatched"
@@ -224,14 +229,13 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                 reason_code = "animal_at_epoch_end" if animal == last else "animal_after_epoch"
                 description = "正好位于" if animal == last else "晚于"
                 reason = f"AnimalStart {description}原 Letter Epoch 终点；AnimalStart 相对 Letter={latency * 1000:.3f} ms，{epoch_range}，该时刻不在 Epoch 内"
-            elif animal - search_samples < first:
-                reason_code = "search_before_epoch"
-                reason = f"原 Letter Epoch 未覆盖完整搜索范围：搜索起点早于 Epoch 起点；搜索起点相对 Letter={(animal - search_samples - (sample - offset)) / fs * 1000:.3f} ms，{epoch_range}"
             elif animal + search_after_samples > last:
                 reason_code = "search_after_epoch"
                 reason = f"原 Letter Epoch 未覆盖完整搜索范围：搜索终点超过 Epoch 终点；搜索终点相对 Letter={(animal + search_after_samples - (sample - offset)) / fs * 1000:.3f} ms，{epoch_range}"
         row["reason_code"] = reason_code
-        row.update(epoch_first=first, epoch_last=last, search_first=animal - search_samples,
+        requested_first = animal - search_samples
+        row.update(epoch_first=first, epoch_last=last, search_first=max(first, requested_first),
+                   requested_search_first=requested_first, search_start_clipped=requested_first < first,
                    search_last=animal + search_after_samples)
         if reason:
             excluded.append({**row, "channel": "", "branch": "both", "status": "excluded", "reason": reason})
@@ -319,6 +323,8 @@ def analyze_animal_peaks(source, markers, matches, settings, progress=None, canc
                     position = trial["search_first"] + index
                     left, right = position - pre, position + post + 1
                     flags = []
+                    if trial["search_start_clipped"]:
+                        flags.append("搜索起点已截至 Epoch 起点")
                     if flat:
                         flags.append("平直片段，极值不代表明确生理波")
                     if index in (0, search.size - 1):
@@ -392,12 +398,29 @@ def _source_metadata(meta):
             "provenance": getattr(meta, "provenance", {})}
 
 
-def trial_detail_trace(source, output, rows, conditioned=None):
-    """Return only the search/excerpt union; no extra context is loaded."""
-    if source_identity(source) != output["source_identity"]:
-        raise ValueError("原数据源已改变，不能使用旧的峰谷结果读取详情；请重新计算。")
+def _trial_detail_bounds(source, output, rows):
+    """Choose display samples separately from the immutable search/mean bounds."""
     first = max(0, min(min(row["search_first"], row["excerpt_first"]) for row in rows))
     last = min(source.metadata.rows, max(max(row["search_last"], row["excerpt_last"]) for row in rows))
+    _group, judgment, _summary = judgment_info(output, rows[0])
+    if judgment and not judgment.get("reason"):
+        first = min(first, judgment["first"]); last = max(last, judgment["last"])
+    before_ms = letter_display_before_ms(output)
+    if before_ms is not None:
+        offset = int(round(source.metadata.time_offset * output["fs"]))
+        marker_local = rows[0]["marker_sample"] - offset
+        first = max(0, marker_local - int(round(before_ms * output["fs"] / 1000)))
+        last = max(last, min(source.metadata.rows, marker_local + 1))
+    if (last - first) * 32 > int(output["settings"].get("memory_budget_bytes", 256 * 1024 * 1024)):
+        raise ValueError("显示片段超过测试内存预算，请缩短 Letter 开始前显示长度。")
+    return first, last
+
+
+def trial_detail_trace(source, output, rows, conditioned=None):
+    """Read the display interval; never change detection or averaging bounds."""
+    if source_identity(source) != output["source_identity"]:
+        raise ValueError("原数据源已改变，不能使用旧的峰谷结果读取详情；请重新计算。")
+    first, last = _trial_detail_bounds(source, output, rows)
     if conditioned is None and any((output["settings"].get("processing") or {}).get(k) for k in ("analysis_notch", "analysis_bandpass", "smooth", "zscore")):
         conditioned = _condition_channel(source, rows[0]["column"], output["settings"])
     values = _read(source, rows[0]["column"], first, last, conditioned) - rows[0]["baseline_correction"]
@@ -414,14 +437,32 @@ def trial_detail_localization(source, output, rows, cancel=None):
     if source_identity(source) != output["source_identity"]:
         raise ValueError("原数据源已改变，请重新计算定位结果。")
     row = rows[0]
+    _group, judgment, _summary = judgment_info(output, row)
+    if judgment and not judgment.get("reason"):
+        row = {**row, "search_first": min(row["search_first"], judgment["first"]),
+               "search_last": max(row["search_last"], judgment["last"])}
     localization = trial_localization(
         lambda first, last: _read(source, row["column"], first, last), row,
         source.metadata.rows, output["fs"], output["settings"], lambda: _check(cancel),
     )
+    first, last = _trial_detail_bounds(source, output, rows)
+    if first < localization["first"] or last > localization["last"]:
+        # Compute extra display context but preserve the original locator
+        # samples exactly, including its original missing-value treatment.
+        extended_row = {**row, "search_first": min(row["search_first"], first),
+                        "search_last": max(row["search_last"], last)}
+        extended = trial_localization(
+            lambda a, b: _read(source, row["column"], a, b), extended_row,
+            source.metadata.rows, output["fs"], output["settings"], lambda: _check(cancel),
+            reserved_bytes=sum(value.nbytes for value in localization.values() if isinstance(value, np.ndarray)),
+        )
+        lo = localization["first"] - extended["first"]
+        hi = lo + localization["last"] - localization["first"]
+        for key in ("despiked", "trend", "despike_mask"):
+            extended[key][lo:hi] = localization[key]
+        localization = extended
     if source_identity(source) != output["source_identity"]:
         raise ValueError("定位曲线读取期间数据源已改变，请重新计算。")
-    first = max(0, min(min(item["search_first"], item["excerpt_first"]) for item in rows))
-    last = min(source.metadata.rows, max(max(item["search_last"], item["excerpt_last"]) for item in rows))
     start, stop = first - localization["first"], last - localization["first"]
     correction = row["baseline_correction"]
     return {"time_ms": (np.arange(first, last) - row["animal_local_sample"]) / output["fs"] * 1000,
@@ -460,26 +501,69 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
 
     if source_identity(source) != output["source_identity"]:
         raise ValueError("数据源已改变，请重新计算后导出。")
+    waveform_y_limits(output)  # Validate display-only settings before creating files.
+    letter_display_before_ms(output)
     folder = Path(directory) / ("animal_peak_test_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6])
     folder.mkdir(parents=True, exist_ok=False)
     manifest = {"status": "incomplete", "settings": output["settings"], "source": output["source"],
-                "units": output["units"], "meaning": "Forced extremum-aligned means; similarity is descriptive, never an inclusion threshold."}
+                "units": output["units"], "meaning": "Automatic-extremum or manually anchored means; similarity is descriptive, never an inclusion threshold."}
+    manifest["display_settings"] = output.get("display_settings", {"y_axis_mode": "auto"})
+    manifest["waveform_display"] = {
+        "amplitude_multiplier": waveform_display(output)[0], "label_unit": waveform_display(output)[1],
+        "meaning": "Display source numeric values directly, matching preprocessing preview; no mV-to-uV conversion or physical recalibration. CSV/NPZ values and declared numerical units remain unchanged.",
+    }
+    manual_history = output.get("manual_alignment_history", [])
+    manifest["manual_alignment_actions"] = len(manual_history)
+    manifest["manual_anchor_count"] = sum(row.get("alignment_origin") == "manual" for row in output["records"])
+    manifest["window_resize_history"] = output.get("window_resize_history", [])
+    manifest["average_trial_selections"] = output.get("average_trial_selections", [])
+    manifest["average_selection_history"] = output.get("average_selection_history", [])
+    manifest["secondary_filter_state"] = output.get("secondary_filter_state", [])
+    manifest["secondary_filter_history"] = output.get("secondary_filter_history", [])
+    from animal_peak_letter_vep import manifest as letter_manifest, export_results as export_letter_results
+    manifest["letter_start_vep"] = letter_manifest(output.get("letter_vep"))
+    manifest["tag100_annotation"] = {
+        "source": "Event CSV column M (Dot Display Time Offset(s)), same row as column N Letter; never use TXT Tag100.",
+        "duration_sec": 2.0,
+        "time_mapping": "Start = CSV M seconds + log/H5 stim_delay_sec; end = start + 2 s. Same offset as Letter markers.",
+        "missing": "Missing/invalid CSV M: report warning and omit shading only; no TXT fallback and no Trial exclusion.",
+        "meaning": "Semi-transparent black cue interval only; does not change any calculation.",
+    }
+    manifest["average_selection_meaning"] = "Missing channel/Tag entry means all available Trials; an explicit empty list means no average. Selection affects averages, not full-group similarity or stored Trial records."
+    similarity = output.get("judgment_similarity")
+    manifest["judgment_similarity_status"] = "stale_not_exported" if similarity and similarity.get("stale") else "current" if similarity else "not_calculated"
+    if similarity and not similarity.get("stale"):
+        manifest["judgment_similarity_parameters"] = similarity["parameters"]
     def save_manifest():
         (folder / "parameters.json").write_text(json.dumps(_json_safe(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     save_manifest()
-    unit = "μV" if output["units"] == "mV" else "z"
-    scale = 1000 if output["units"] == "mV" else 1
+    if manual_history:
+        (folder / "manual_alignment.json").write_text(json.dumps(_json_safe({
+            "source": output["source"], "settings": output["settings"], "history": manual_history,
+            "window_resize_history": output.get("window_resize_history", []),
+            "anchors": [row for row in output["records"] if "automatic_alignment" in row],
+            "meaning": "Operator-selected anchors; no extrema snapping; averages retain loaded-waveform samples.",
+        }), ensure_ascii=False, indent=2), encoding="utf-8")
+    scale, unit = waveform_display(output)
     records = output["records"]
-    keys = sorted({key for row in records for key in row})
+    choices = {(entry["channel"], entry["tag"]): set(entry["trial_ids"])
+               for entry in output.get("average_trial_selections", [])}
+    def average_selected(row):
+        selected = choices.get((row.get("channel"), row.get("tag")))
+        return ("extreme_local_sample" in row or row.get("branch") == "animal") and (selected is None or row["trial_id"] in selected)
+    keys = sorted({key for row in records for key in row if key != "automatic_alignment"} | {"alignment_origin", "average_selected", "average_included"})
     with (folder / "trial_details.csv").open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
-        writer.writerows(records)
+        writer.writerows({**{key: row.get(key, "automatic" if key == "alignment_origin" and "extreme_local_sample" in row else "")
+                          for key in keys}, "average_selected": average_selected(row),
+                          "average_included": average_selected(row) and row.get("status") == "included"} for row in records)
     if output.get("animal_reference_records"):
         reference_records = output["animal_reference_records"]
         with (folder / "animalstart_reference_details.csv").open("w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.DictWriter(handle, fieldnames=sorted({key for row in reference_records for key in row}))
-            writer.writeheader(); writer.writerows(reference_records)
+            writer = csv.DictWriter(handle, fieldnames=sorted({key for row in reference_records for key in row} | {"average_selected","average_included"}))
+            writer.writeheader(); writer.writerows({**row,"average_selected":average_selected(row),
+                "average_included":average_selected(row) and row.get("status")=="included"} for row in reference_records)
     pairs = defaultdict(dict)
     for group in output["groups"]:
         pairs[(group["channel"], group["tag"])][group["branch"]] = group
@@ -492,6 +576,9 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
     count = len(pairs) + len(detail_sets)
     done = 0
     try:
+        if similarity and not similarity.get("stale"):
+            from animal_peak_similarity import export_similarity_report
+            export_similarity_report(output, folder, cancel)
         with rc_context(PLOT_STYLE), PdfPages(folder / "all_trial_details.pdf") as pdf:
             _check(cancel)
             overview = Figure(figsize=(12, 8), layout="constrained"); FigureCanvasAgg(overview)
@@ -513,10 +600,14 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                 f"AnimalStart 前/后搜索：{configuration['search_ms']:g}/{configuration.get('search_after_ms', 0):g} ms | 极值前/后截取：{configuration['pre_ms']:g}/{configuration['post_ms']:g} ms",
                 (f"定位方式：去毛刺＋趋势线；去毛刺窗={configuration.get('despike_window_ms')} ms，MAD={configuration.get('despike_mad_threshold')}，平滑窗={configuration.get('trend_window_ms')} ms；只定位，平均载入波形。"
                  if configuration.get("localization_mode") == "trend" else "定位方式：原波形极值（旧方式）"),
-                f"有效 AnimalStart Trial：{len(output['eligible_trials'])} | 峰谷纳入记录：{sum(r['status']=='included' for r in records)}",
-                "每个有效 trial 都选最大值和最小值；同值取更接近 AnimalStart 的采样点，等距离取较晚点。",
+                f"有效 AnimalStart Trial：{len(output['eligible_trials'])} | 平均前可用峰谷记录：{sum(r['status']=='included' for r in records)}",
+                f"平均Trial人工选择：{len(output.get('average_trial_selections', []))} 个通道/Tag分组有自定义选择（见parameters.json）；未设定的分组默认全选。全部明细仍保留，average_selected / average_included 区分选择与实际纳入。",
+                f"人工点位：{manifest['manual_anchor_count']} 个；人工操作历史：{len(manual_history)} 次（详见 manual_alignment.json）。",
+                f"二次滤波：当前 {len(manifest['secondary_filter_state'])} 个通道，完整载入时长；点位保留，基线/平均已按当前信号重算。参数及应用/恢复历史见 parameters.json。",
+                f"判断窗相似度：{manifest['judgment_similarity_status']}；已计算时详见 response_similarity/report.html 及汇总/完整排名 CSV。",
+                "自动初始点取最大值和最小值，同值取最近点；已确认的人工位置优先，不吸附极值。",
                 "正负分支独立平均，不反转、不归一化；相似度仅报告，不筛选。",
-                "平均图零点=选中极值；逐 trial 详情零点=AnimalStart。",
+                "平均图零点=最终对齐点（自动极值/人工锚点）；逐 trial 详情零点=AnimalStart。",
                 "排除原因（包含原 trial 排除及通道/分支不可计算记录）：",
                 *[f"  {reason}：{number}" for reason, number in reasons.items()],
                 "完整参数与处理历史见 parameters.json；所有 trial 编号、极值及原因见 trial_details.csv。",
@@ -526,24 +617,27 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
             overview.savefig(folder / "overview.png", dpi=220)
             overview.savefig(folder / "overview.pdf")
             pdf.savefig(overview); overview.clear()
+            export_letter_results(source, output, folder, combined_pdf=pdf, progress=progress, cancel=cancel)
             for (channel, tag), branches in sorted(pairs.items()):
                 _check(cancel)
                 fig = Figure(figsize=(12, 8), layout="constrained"); FigureCanvasAgg(fig)
                 axes = fig.subplots(2, 2)
                 fig.suptitle(f"{Path(output['source']['path']).name}\nch{channel} | Tag {tag} | 最大峰 / 最小谷对齐平均（相似度不筛选）", fontsize=12)
                 for column, branch in enumerate(("peak", "trough")):
-                    group = branches.get(branch)
+                    group = selected_average_group(output, branches.get(branch), cancel)
                     title = "最大峰" if branch == "peak" else "最小谷"
+                    if group is not None and any(row.get("alignment_origin") == "manual" for row in group["rows"]):
+                        title = ("峰分支" if branch == "peak" else "谷分支") + "（含人工锚点）"
                     if group is None:
                         axes[0, column].set_title(title + "：无完整截取片段")
                         continue
                     t = group["time_ms"]
                     axes[0, column].plot(t, group["waves"].T * scale, color="0.6", alpha=.22, linewidth=.5)
-                    axes[0, column].plot(t, group["mean"] * scale, color="#b32025", linewidth=1.8, label="全部片段等权平均")
+                    axes[0, column].plot(t, group["mean"] * scale, color="#b32025", linewidth=1.8, label="所选Trial等权平均")
                     axes[0, column].fill_between(t, (group["mean"]-group["sem"])*scale,
                                                  (group["mean"]+group["sem"])*scale, color="#b32025", alpha=.15, label="±SEM")
                     axes[0, column].axvline(0, color="black", linestyle="--", linewidth=.8)
-                    axes[0, column].set(title=f"{title}对齐 | n={len(group['rows'])}", xlabel="相对选中极值（ms）", ylabel=unit)
+                    axes[0, column].set(title=f"{title}对齐 | n={len(group['rows'])}" + ("（未选中可用Trial）" if not group["rows"] else ""), xlabel="相对最终对齐点（ms）", ylabel=unit)
                     axes[0, column].legend(fontsize=8)
                     latency = [row["extreme_relative_ms"] for row in group["rows"]]
                     axes[1, column].hist(latency, bins=min(20, max(1, len(latency))), color="#4177a3", alpha=.8)
@@ -556,9 +650,23 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                                         animal_sec=np.asarray([row["animal_sec"] for row in group["rows"]]),
                                         extrema_relative_ms=np.asarray(latency),
                                         similarity_r=np.asarray([row["similarity_r"] for row in group["rows"]]),
+                                        alignment_origin=np.asarray([row.get("alignment_origin", "automatic") for row in group["rows"]]),
+                                        automatic_relative_ms=np.asarray([row.get("automatic_relative_ms", row["extreme_relative_ms"]) for row in group["rows"]]),
+                                        anchor_global_samples=np.asarray([row["extreme_sample"] for row in group["rows"]]),
+                                        all_available_trial_ids=np.asarray([row["trial_id"] for row in branches[branch]["rows"]]),
                                         units=output["units"], channel=channel, tag=tag)
-                reference = next((item for item in output.get("animal_reference_groups", [])
-                                  if item["channel"] == channel and item["tag"] == tag), None)
+                    manual_count = sum(row.get("alignment_origin") == "manual" for row in group["rows"])
+                    with (folder / (name + "_average.csv")).open("w", newline="", encoding="utf-8-sig") as handle:
+                        writer = csv.writer(handle)
+                        writer.writerow(["time_ms", "mean", "sem", "valid_count", "unit", "trial_count", "manual_anchor_count", "manual_revision", "window_resize_revision", "average_selection_revision"])
+                        for sample, (time_value, mean_value, sem_value, valid_value) in enumerate(zip(
+                                t, group["mean"], group["sem"], group["valid_count"])):
+                            if sample % 1024 == 0:
+                                _check(cancel)
+                            writer.writerow([time_value, mean_value, sem_value, valid_value,
+                                             output["units"], len(group["rows"]), manual_count, len(manual_history), len(output.get("window_resize_history", [])), len(output.get("average_selection_history", []))])
+                reference = selected_average_group(output, next((item for item in output.get("animal_reference_groups", [])
+                                  if item["channel"] == channel and item["tag"] == tag), None), cancel)
                 if reference is not None:
                     ref_fig = Figure(figsize=(10, 5), layout="constrained"); FigureCanvasAgg(ref_fig)
                     ref_axis = ref_fig.subplots()
@@ -570,6 +678,7 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                     ref_axis.set(title=f"ch{channel} | Tag {tag} | AnimalStart 直接对齐对照 | n={len(reference['rows'])}",
                                  xlabel="相对 AnimalStart（ms）", ylabel=unit)
                     ref_axis.legend(); ref_axis.grid(alpha=.15)
+                    apply_waveform_y_limits(ref_axis, output)
                     ref_name = f"ch{channel}_tag{tag}_animalstart_reference"
                     ref_fig.savefig(folder / (ref_name + ".png"), dpi=220)
                     ref_fig.savefig(folder / (ref_name + ".pdf")); pdf.savefig(ref_fig); ref_fig.clear()
@@ -577,6 +686,8 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                                         trials=reference["waves"], mean=reference["mean"], sem=reference["sem"],
                                         valid_count=reference["valid_count"], units=output["units"], channel=channel, tag=tag,
                                         trial_ids=np.asarray([row["trial_id"] for row in reference["rows"]]))
+                for waveform_axis in axes[0]:
+                    apply_waveform_y_limits(waveform_axis, output)
                 fig.savefig(folder / f"ch{channel}_tag{tag}_summary.png", dpi=220)
                 fig.savefig(folder / f"ch{channel}_tag{tag}_summary.pdf")
                 pdf.savefig(fig); fig.clear()

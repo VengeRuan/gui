@@ -45,7 +45,6 @@ class ExclusionReasonTests(unittest.TestCase):
             (3250, -1, {}, "animal_before_epoch", "-1000.000 ms"),
             (3250, 2, {}, "animal_at_epoch_end", "正好位于"),
             (3250, 2.2, {}, "animal_after_epoch", "2200.000 ms"),
-            (3250, -.4, {}, "search_before_epoch", "-700.000 ms"),
             (3250, 1.9, {"search_after_ms": 200}, "search_after_epoch", "2100.000 ms"),
         ]
         for sample, latency, extra, code, evidence in cases:

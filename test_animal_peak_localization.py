@@ -37,6 +37,26 @@ def trend_fixture():
 
 
 class LocalizationTests(unittest.TestCase):
+    def test_extra_letter_display_context_preserves_original_locator_and_raw_data(self):
+        source, markers, matches, settings = trend_fixture()
+        output = analyze_animal_peaks(source, markers[:1], matches, settings)
+        rows = output["records"]
+        original = trial_detail_localization(source, output, rows)
+        original_data = source.data.copy()
+        output["display_settings"] = {"letter_before_ms": 800}
+        time_ms, raw = trial_detail_trace(source, output, rows)
+        extended = trial_detail_localization(source, output, rows)
+        self.assertEqual(time_ms[0], -1800)
+        np.testing.assert_array_equal(time_ms, extended["time_ms"])
+        common = np.searchsorted(time_ms, original["time_ms"])
+        for key in ("trend", "despiked", "despike_mask"):
+            np.testing.assert_array_equal(extended[key][common], original[key])
+        for row in rows:
+            index = np.argmin(abs(time_ms - row["extreme_relative_ms"]))
+            self.assertAlmostEqual(float(extended["trend"][index]), row["localization_amplitude"], places=6)
+        np.testing.assert_array_equal(source.data, original_data)
+        self.assertEqual(len(raw), len(extended["trend"]))
+
     def test_spikes_do_not_win_but_original_samples_are_averaged(self):
         source, markers, matches, settings = trend_fixture()
         original = source.data.copy()
@@ -87,8 +107,8 @@ class LocalizationTests(unittest.TestCase):
         draw_trial_detail(raw_axis, output, rows, t, raw, curve, "raw")
         draw_trial_detail(trend_axis, output, rows, t, raw, curve, "trend")
         self.assertGreater(np.ptp(raw_axis.get_ylim()), np.ptp(trend_axis.get_ylim()) * 5)
-        np.testing.assert_array_equal(raw_axis.lines[0].get_ydata(), raw * 1000)
-        np.testing.assert_array_equal(trend_axis.lines[0].get_ydata(), curve["trend"] * 1000)
+        np.testing.assert_array_equal(raw_axis.lines[0].get_ydata(), raw)
+        np.testing.assert_array_equal(trend_axis.lines[0].get_ydata(), curve["trend"])
 
     def test_nonfinite_samples_are_not_candidates_and_raw_gaps_are_preserved(self):
         source, markers, matches, settings = trend_fixture()
