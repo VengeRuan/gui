@@ -9,6 +9,10 @@ __pycache__/
 
 # Python virtual environments
 .venv/
+.venv-mcp/
+.mcp_validation/
+mcp_exports/
+mcp_workstation.local.toml
 venv/
 env/
 ENV/

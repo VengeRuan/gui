@@ -508,6 +508,8 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
     manifest = {"status": "incomplete", "settings": output["settings"], "source": output["source"],
                 "units": output["units"], "meaning": "Automatic-extremum or manually anchored means; similarity is descriptive, never an inclusion threshold."}
     manifest["display_settings"] = output.get("display_settings", {"y_axis_mode": "auto"})
+    if output.get("mcp_control_history"):
+        manifest["mcp_control_history"] = output["mcp_control_history"]
     manifest["waveform_display"] = {
         "amplitude_multiplier": waveform_display(output)[0], "label_unit": waveform_display(output)[1],
         "meaning": "Display source numeric values directly, matching preprocessing preview; no mV-to-uV conversion or physical recalibration. CSV/NPZ values and declared numerical units remain unchanged.",

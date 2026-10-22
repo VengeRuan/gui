@@ -1,0 +1,12 @@
+# EXAMPLE ONLY. Add to the desktop client's local MCP config, not to the server.
+# Replace YOUR_SSH_ALIAS with an existing key-authenticated SSH profile.
+# The SSH profile must use the SAME Windows account as the GUI desktop session.
+# Never store passwords, private keys, or runtime bridge tokens in this file.
+[mcp_servers.animalstart_workstation]
+command = 'C:\Windows\System32\OpenSSH\ssh.exe'
+# Windows OpenSSH needs PROGRAMDATA; MCP clients may omit it from inherited env.
+# Use this computer's actual ProgramData path if different.
+env = { PROGRAMDATA = 'C:\ProgramData' }
+args = ['-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', 'YOUR_SSH_ALIAS', 'cmd.exe /d /c D:\Users\Ruan\gui\start_animal_peak_mcp.cmd']
+startup_timeout_sec = 30
+tool_timeout_sec = 30

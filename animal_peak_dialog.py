@@ -234,6 +234,9 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._fixed_y_limits = None
         self._event_y_override = None
         self._event_plot_width = None
+        self._mcp_controller = None
+        self._mcp_bridge = None
+        self._mcp_discard_close = False
         self._letter_before_ms = min(60000, max(0, -float(defaults["epoch_start_ms"])))
         self._parameters_dirty = False
         self._other_parameters_dirty = False
@@ -571,6 +574,57 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             widget.textChanged.connect(self.parameters_changed)
         self.processing_check.toggled.connect(self.parameters_changed)
         self._localization_changed()
+        self._build_mcp_controls(layout)
+
+    def _build_mcp_controls(self, layout):
+        box = QtWidgets.QGroupBox("MCP 自动化控制（默认关闭；仅控制此测试窗口）")
+        row = QtWidgets.QHBoxLayout(box)
+        self.mcp_enabled_check = QtWidgets.QCheckBox("允许 MCP 控制")
+        self.mcp_export_root = QtWidgets.QLineEdit(str(Path(__file__).resolve().parent / "mcp_exports"))
+        self.mcp_export_root.setMinimumWidth(320)
+        self.mcp_export_root.setToolTip("授权的导出根目录；MCP不能在该目录之外写文件。启用期间不可更改。")
+        self.mcp_root_button = QtWidgets.QPushButton("选择导出根目录")
+        self.mcp_status = QtWidgets.QLabel("关闭：不监听端口，不开放控制，不需要安装MCP SDK。")
+        self.mcp_status.setWordWrap(True)
+        for widget in (self.mcp_enabled_check, self.mcp_export_root, self.mcp_root_button): row.addWidget(widget)
+        row.addWidget(self.mcp_status, 1)
+        layout.insertWidget(1, box)
+        self.mcp_enabled_check.toggled.connect(self._set_mcp_enabled)
+        self.mcp_root_button.clicked.connect(self._choose_mcp_root)
+
+    def _choose_mcp_root(self):
+        if self._busy or self._mcp_bridge is not None:
+            return
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "选择MCP允许写入的导出根目录", self.mcp_export_root.text())
+        if path: self.mcp_export_root.setText(path)
+
+    def _set_mcp_enabled(self, enabled):
+        if enabled and self._mcp_bridge is None:
+            try:
+                root = Path(self.mcp_export_root.text()).expanduser().resolve()
+                if not self.mcp_export_root.text().strip() or root == Path(root.anchor):
+                    raise ValueError("请选择专用导出目录，不能授权整个磁盘根目录。")
+                self.mcp_export_root.setText(str(root))
+                from animal_peak_control import AnimalPeakController
+                from animal_peak_bridge import AnimalPeakBridge
+                if self._mcp_controller is None: self._mcp_controller = AnimalPeakController(self)
+                self._mcp_bridge = AnimalPeakBridge(self._mcp_controller)
+                self.mcp_status.setText("已启用，会话 " + self._mcp_bridge.session_id + "；停止控制不取消后台计算。")
+            except Exception as exc:
+                self.mcp_enabled_check.blockSignals(True); self.mcp_enabled_check.setChecked(False)
+                self.mcp_enabled_check.blockSignals(False)
+                self.mcp_status.setText("未启用：" + str(exc))
+        elif not enabled:
+            if self._mcp_bridge is not None:
+                self._mcp_bridge.close(); self._mcp_bridge.deleteLater(); self._mcp_bridge = None
+            self.mcp_status.setText("MCP控制已关闭。")
+        self.mcp_export_root.setReadOnly(self._mcp_bridge is not None)
+        self.mcp_root_button.setEnabled(self._mcp_bridge is None and not self._busy)
+
+    def _warning(self, title, message):
+        if self._mcp_controller is not None and self._mcp_controller.command_active:
+            raise ValueError(title + "：" + message)
+        return QtWidgets.QMessageBox.warning(self, title, message)
 
     @staticmethod
     def _spin(value, low, high):
@@ -645,7 +699,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             return
         low, high = self.y_min_spin.value(), self.y_max_spin.value()
         if low >= high:
-            QtWidgets.QMessageBox.warning(self, "Y 轴范围无效", "下限必须小于上限；尚未改变当前显示范围。")
+            self._warning("Y 轴范围无效", "下限必须小于上限；尚未改变当前显示范围。")
             return
         self._fixed_y_limits = (low, high)
         self._refresh_y_axis_display()
@@ -661,7 +715,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             return
         low, high = self.letter_vep_y_min.value(), self.letter_vep_y_max.value()
         if low >= high:
-            QtWidgets.QMessageBox.warning(self, "Y 轴范围无效", "下限必须小于上限；尚未改变当前显示范围。")
+            self._warning("Y 轴范围无效", "下限必须小于上限；尚未改变当前显示范围。")
             return
         self._event_y_override = dict(y_axis_mode="fixed", y_min=low, y_max=high)
         self._sync_y_axis_display()
@@ -870,7 +924,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         try:
             config = self._letter_vep_config()
         except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "事件对齐参数无效", str(exc)); return
+            self._warning("事件对齐参数无效", str(exc)); return
         self._set_busy(True); self.progress.setValue(0)
         self.status.setText(f"正在按{letter_vep.ALIGNMENTS[config['alignment']]}截取并平均；保留全部峰谷点位与共用名单，取消不改变旧结果。")
         self.worker = AnimalPeakWorker(self.source, self.markers, self.matches, config, self,
@@ -897,7 +951,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             if self._letter_vep_config() != state["parameters"]:
                 raise ValueError("参数或对齐方式已改，请先刷新事件对齐VEP，再选择Trial。")
         except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "请先刷新", str(exc)); return
+            self._warning("请先刷新", str(exc)); return
         dialog = AverageTrialSelectionDialog(self, self.output, self._current_pair(), letter_group=group)
         try:
             if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -916,7 +970,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if self._busy:
             return
         if not self._event_plot_copy_ready():
-            QtWidgets.QMessageBox.warning(self, "尚无可复制的图", "请先刷新当前通道/Tag/对齐方式的事件对齐平均图；不会复制旧组结果或覆盖剪贴板。")
+            self._warning("尚无可复制的图", "请先刷新当前通道/Tag/对齐方式的事件对齐平均图；不会复制旧组结果或覆盖剪贴板。")
             return
         self._sync_event_plot_size()
         # Grab the entire PlotWidget, not just the ViewBox: the title and both
@@ -924,7 +978,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         # partially outside the outer scroll viewport; no data is reread.
         pixmap = self.letter_vep_plot.grab()
         if pixmap.isNull():
-            QtWidgets.QMessageBox.warning(self, "复制图片失败", "未能生成图像，请重试；尚未覆盖剪贴板。")
+            self._warning("复制图片失败", "未能生成图像，请重试；尚未覆盖剪贴板。")
             return
         QtWidgets.QApplication.clipboard().setPixmap(pixmap)
         self.status.setText("已复制当前事件对齐图（含通道/Tag/Trial数量、标题、坐标轴及波形），可直接Ctrl+V粘贴。")
@@ -1026,11 +1080,11 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if hasattr(self,"_event_plot_resize_timer"):
             self._event_plot_resize_timer.start(0)
 
-    def start_secondary_filter(self, restore=False):
+    def start_secondary_filter(self, restore=False, *, confirmed=False):
         if self._busy or self.output is None:
             return
         if self._parameters_dirty:
-            QtWidgets.QMessageBox.warning(self, "提取参数待刷新", "请先应用/恢复待修改的提取参数，再进行二次滤波；不会重新自动找点。")
+            self._warning("提取参数待刷新", "请先应用/恢复待修改的提取参数，再进行二次滤波；不会重新自动找点。")
             return
         try:
             text = self.secondary_channels.text().replace("，", ",").replace(";", ",")
@@ -1048,10 +1102,10 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             elif not isinstance(self.source, SecondaryFilteredSource) or not any(ch in self.source.channels for ch in channels):
                 raise ValueError("选定通道尚未进行二次滤波，无需恢复。")
         except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "二次滤波参数无效", str(exc)); return
+            self._warning("二次滤波参数无效", str(exc)); return
         cache_mb = self.source.metadata.rows*4*len(channels)/1024**2
         action = "恢复载入时的数据" if restore else "从载入时的数据重新滤波（不叠加上次二次滤波）"
-        answer = QtWidgets.QMessageBox.question(self, "确认完整时长通道处理",
+        answer = QtWidgets.QMessageBox.StandardButton.Yes if confirmed else QtWidgets.QMessageBox.question(self, "确认完整时长通道处理",
             f"通道：{','.join(map(str,channels))}\n范围：当前 H5 全部 {self.source.metadata.rows/self.source.metadata.fs:.3f} 秒，各 Tag/Trial 一起更新。\n"
             f"将{action}，保留已有自动/人工点位和平均Trial选择，重新计算基线及平均；判断窗相似度需重算。\n"
             + ("" if restore else f"临时通道缓存约 {cache_mb:.1f} MB，另需一条通道的双向计算工作文件；恢复/关闭后自动释放。\n")
@@ -1142,6 +1196,13 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         with rc_context(PLOT_STYLE):
             self.similarity_figure = Figure(figsize=(7, 5), layout="constrained")
         self.similarity_canvas = FigureCanvasQTAgg(self.similarity_figure)
+        # FigureCanvas.sizeHint follows its last allocated figure dimensions.
+        # Do not feed those dimensions back into nested tab/outer-scroll hints:
+        # opening the heatmap otherwise grows the layout until Qt stack overflow.
+        self.similarity_canvas.setMinimumWidth(260)
+        self.similarity_canvas.setFixedHeight(400)
+        self.similarity_canvas.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                             QtWidgets.QSizePolicy.Policy.Fixed)
         self.similarity_views.addTab(self.similarity_canvas, "两两相似度热图")
         self.similarity_reference_box.currentIndexChanged.connect(self._similarity_reference_changed)
         self.similarity_trial_box.currentIndexChanged.connect(self._render_similarity_rankings)
@@ -1167,7 +1228,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if self._busy or self.output is None:
             return
         if self._parameters_dirty or self.output["settings"].get("localization_mode") != "trend":
-            QtWidgets.QMessageBox.warning(self, "需要趋势提取结果", "请先选择趋势定位并重新提取峰谷，再计算判断窗相似度。")
+            self._warning("需要趋势提取结果", "请先选择趋势定位并重新提取峰谷，再计算判断窗相似度。")
             return
         self._set_busy(True); self.progress.setValue(0)
         self.status.setText("正在计算判断窗趋势线两两相似度；不修改平均，不筛选 Trial。")
@@ -1407,10 +1468,10 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if not busy:
             self._manual_selection_changed()
 
-    def start_analysis(self):
+    def start_analysis(self, *, confirm_discard=False):
         if self._busy:
             return
-        if self._has_unsaved_edits():
+        if self._has_unsaved_edits() and not confirm_discard:
             answer = QtWidgets.QMessageBox.question(
                 self, "修改尚未导出", "重新提取将清除本窗口的人工点位、截取窗、Trial平均选择及LetterStart VEP，请先保存完整结果。仍要重新提取吗？",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
@@ -1433,7 +1494,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             if any(tag not in (4, 5, 6, 7) for tag in settings["tags"]):
                 raise ValueError("此测试只支持 Letter Tag 4/5/6/7。")
         except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "参数无效", str(exc)); return
+            self._warning("参数无效", str(exc)); return
         self.output = None  # Release the previous waveform set before computing another.
         self._exported_manual_actions = 0
         self._exported_window_resizes = 0
@@ -1466,6 +1527,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         worker.failed.connect(self.failed)
         worker.cancelled.connect(self.cancelled)
         worker.finished.connect(self._worker_finished)
+        if self._mcp_controller is not None:
+            self._mcp_controller.worker_started(worker)
 
     def update_progress(self, value, text):
         if self.worker is not None and (getattr(self.worker, "_ui_cancel_requested", False)
@@ -1578,7 +1641,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         index = self.result_channel_box.findData(channel) if channel is not None else -1
         if index < 0:
             self.result_channel_box.setEditText(f"ch{self._selected_result_channel}")
-            QtWidgets.QMessageBox.warning(self, "通道无结果", "请输入当前 Tag 下已有结果的实际通道号。未计算的通道不能直接切换；请在第三页重新选择并计算对齐后，再重新运行测试。")
+            self._warning("通道无结果", "请输入当前 Tag 下已有结果的实际通道号。未计算的通道不能直接切换；请在第三页重新选择并计算对齐后，再重新运行测试。")
             return
         previous = self._selected_result_channel
         self.result_channel_box.blockSignals(True)
@@ -1619,7 +1682,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             self.export_button.setEnabled(True)
             self.status.setText("已更新本组所选 Trial 的峰/谷平均、SEM及AnimalStart平均；点位和全部明细保留，全组判断窗相似度统计不变。请保存完整结果。")
         except ValueError as exc:
-            QtWidgets.QMessageBox.warning(self, "Trial选择无效", str(exc))
+            self._warning("Trial选择无效", str(exc))
         finally:
             dialog.deleteLater()
 
@@ -1637,7 +1700,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if self._busy or self.output is None or self._current_pair() is None:
             return
         if self._other_parameters_dirty:
-            QtWidgets.QMessageBox.warning(self, "其他提取参数已修改", "保留人工点位刷新目前只支持“特征点前/后截取 ms”。请先恢复搜索、定位方式、趋势、通道/Tag及额外处理等其他修改，再刷新；或保存当前人工结果后重新提取。")
+            self._warning("其他提取参数已修改", "保留人工点位刷新目前只支持“特征点前/后截取 ms”。请先恢复搜索、定位方式、趋势、通道/Tag及额外处理等其他修改，再刷新；或保存当前人工结果后重新提取。")
             return
         if self._window_parameters_dirty:
             self._resize_view_state = (self._current_pair(), self._detail_page, self.manual_trial_box.currentData())
@@ -1932,14 +1995,15 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         finally:
             self._rendering = False
 
-    def start_export(self):
+    def start_export(self, *, directory=None, confirmed=False):
         if self._busy or self.output is None:
             return
         state = self.output.get("letter_vep")
         if state and state.get("stale"):
-            QtWidgets.QMessageBox.warning(self, "事件对齐 VEP待刷新", "二次滤波/恢复后信号已变化，请先刷新事件对齐VEP，再保存完整结果。")
+            self._warning("事件对齐 VEP待刷新", "二次滤波/恢复后信号已变化，请先刷新事件对齐VEP，再保存完整结果。")
             return
-        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择完整测试结果的保存目录")
+        if directory is None:
+            directory = QtWidgets.QFileDialog.getExistingDirectory(self, "选择完整测试结果的保存目录")
         if not directory:
             return
         details = {(row["channel"], row["tag"], row["trial_id"]) for row in self.output["records"] if "extreme_local_sample" in row}
@@ -1949,13 +2013,16 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             except ValueError: letter_pending = True
             pending += "\n包含已刷新过的各事件对齐方式、全部通道/Tag、共用Trial名单及数据。"
             if letter_pending: pending += "\n事件对齐参数/方式待刷新：将导出已应用过的模式及其参数，不使用尚未刷新的输入值。"
-        answer = QtWidgets.QMessageBox.question(self, "确认详细导出", f"将创建独立结果目录，保存 {len(details)} 个 trial×通道的找波详情、分页PDF、平均图、CSV、NPZ及参数。\n独立trial PNG：{'开启' if self.individual_check.isChecked() else '关闭'}。{pending}\n可能耗时并占用较多空间，是否继续？")
+        answer = QtWidgets.QMessageBox.StandardButton.Yes if confirmed else QtWidgets.QMessageBox.question(self, "确认详细导出", f"将创建独立结果目录，保存 {len(details)} 个 trial×通道的找波详情、分页PDF、平均图、CSV、NPZ及参数。\n独立trial PNG：{'开启' if self.individual_check.isChecked() else '关闭'}。{pending}\n可能耗时并占用较多空间，是否继续？")
         yes = QtWidgets.QMessageBox.StandardButton.Yes if hasattr(QtWidgets.QMessageBox, "StandardButton") else QtWidgets.QMessageBox.Yes
         if answer != yes:
             return
         self._set_busy(True); self.progress.setValue(0)
+        export_output = self.output
+        if self._mcp_controller is not None and self._mcp_controller.audit:
+            export_output = {**self.output, "mcp_control_history": list(self._mcp_controller.audit)}
         self.worker = AnimalPeakWorker(self.source, None, None, {}, self,
-                                       export=(self.output, directory, self.individual_check.isChecked()))
+                                       export=(export_output, directory, self.individual_check.isChecked()))
         self._wire_worker(self.worker)
         self.worker.completed.connect(lambda folder, worker=self.worker: self._accept_completion(
             worker, self._export_finished, folder))
@@ -1987,7 +2054,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             self.cancelled(message)
             return
         self.status.setText(message)
-        if not self._close_requested:
+        if not self._close_requested and not getattr(self.worker, "_mcp_job_id", None):
             QtWidgets.QMessageBox.warning(self, "测试操作未完成", message)
 
     def cancelled(self, message="已取消测试操作"):
@@ -2014,7 +2081,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         if self._busy:
             self._close_requested = True; self.cancel(); event.ignore()
         else:
-            if self._has_unsaved_edits():
+            if self._has_unsaved_edits() and not self._mcp_discard_close:
                 answer = QtWidgets.QMessageBox.question(
                     self, "修改尚未导出", "存在尚未保存的人工点位、截取窗、Trial平均选择、二次滤波或LetterStart VEP结果。关闭后会释放滤波缓存且不能直接恢复本窗口，是否仍要关闭？",
                     QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
@@ -2022,6 +2089,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                 if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                     self._close_requested = False
                     event.ignore(); return
+            self._set_mcp_enabled(False)
             self.source = self._base_source
             self.output = None  # Release private filter caches/arrays on an accepted close.
             self._detail_conditioned = None

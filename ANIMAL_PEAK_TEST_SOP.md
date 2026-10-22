@@ -2,6 +2,8 @@
 
 这是独立实验功能，不改写原 Letter、SNR、预处理或扩展分析结果。
 
+MCP控制默认关闭；完整接口范围、SSH部署、安全约束及验证方式见 [MCP_ANIMALSTART_GUIDE.md](MCP_ANIMALSTART_GUIDE.md)。`v2.1.10-no-mcp` 及此前发布版本未集成MCP。
+
 ## 操作
 
 1. 加载用于 LFP 分析的数据，在第三页时间对齐中选择健康通道（不填写通道号时使用全部健康通道），导入对应的行为检测结果，选择 Letter 并点击“计算并刷新对齐”。需要有效的 AnimalStart 信息。
