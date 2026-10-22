@@ -778,7 +778,11 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.letter_vep_width.setMaximumWidth(145)
         self.letter_vep_width_apply = QtWidgets.QPushButton("应用图框宽度")
         self.letter_vep_width_auto = QtWidgets.QPushButton("恢复自动参考宽度")
-        for widget in (self.letter_vep_width, self.letter_vep_width_apply, self.letter_vep_width_auto):
+        self.letter_vep_copy = QtWidgets.QPushButton("复制当前图（含标题）")
+        self.letter_vep_copy.setEnabled(False)
+        self.letter_vep_copy.setToolTip("将当前显示的完整图框复制为图片，包含通道/Tag/Trial数量、对齐标题、坐标轴及波形；不包含参数按钮或明细表。可直接Ctrl+V粘贴，未刷新参数不会重新计算。")
+        self.letter_vep_copy.clicked.connect(self.copy_event_plot)
+        for widget in (self.letter_vep_width, self.letter_vep_width_apply, self.letter_vep_width_auto, self.letter_vep_copy):
             width_row.addWidget(widget)
         width_row.addStretch(1)
         self.letter_vep_width_box.setToolTip("默认参考逐Trial自动计算宽度；手动输入后点击应用。宽度按逻辑像素设置，受页面可用宽度及文字最小可读宽度限制；只改变图框，不改变横轴时间范围、纵轴范围和平均数据。")
@@ -901,10 +905,35 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         finally:
             dialog.deleteLater()
 
+    def _event_plot_copy_ready(self):
+        state = self.output.get("letter_vep") if self.output is not None else None
+        group = state.get("cache") if state else None
+        return (group is not None and not state.get("stale")
+                and (group["channel"], group["tag"]) == self._current_pair()
+                and group["parameters"].get("alignment", "letter") == self.letter_vep_alignment.currentData())
+
+    def copy_event_plot(self):
+        if self._busy:
+            return
+        if not self._event_plot_copy_ready():
+            QtWidgets.QMessageBox.warning(self, "尚无可复制的图", "请先刷新当前通道/Tag/对齐方式的事件对齐平均图；不会复制旧组结果或覆盖剪贴板。")
+            return
+        self._sync_event_plot_size()
+        # Grab the entire PlotWidget, not just the ViewBox: the title and both
+        # axes belong to this widget too. Qt renders it even when the page is
+        # partially outside the outer scroll viewport; no data is reread.
+        pixmap = self.letter_vep_plot.grab()
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, "复制图片失败", "未能生成图像，请重试；尚未覆盖剪贴板。")
+            return
+        QtWidgets.QApplication.clipboard().setPixmap(pixmap)
+        self.status.setText("已复制当前事件对齐图（含通道/Tag/Trial数量、标题、坐标轴及波形），可直接Ctrl+V粘贴。")
+
     def _render_letter_vep(self):
         if not hasattr(self, "letter_vep_plot"):
             return
         plot = self.letter_vep_plot; plot.clear(); self.letter_vep_table.setRowCount(0)
+        self.letter_vep_copy.setEnabled(False)
         state = self.output.get("letter_vep") if self.output is not None else None
         group = state.get("cache") if state else None
         if group is None or state.get("stale") or (group["channel"], group["tag"]) != self._current_pair() or group["parameters"].get("alignment", "letter") != self.letter_vep_alignment.currentData():
@@ -938,6 +967,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                 item = QtWidgets.QTableWidgetItem(str(value)); item.setToolTip(str(value)); self.letter_vep_table.setItem(index,column,item)
         self.letter_vep_table.resizeColumnsToContents(); self._apply_waveform_y_ranges()
         self._sync_event_plot_size()
+        self.letter_vep_copy.setEnabled(not self._busy)
 
     def _sync_event_plot_size(self):
         if not hasattr(self, "letter_vep_plot"):
@@ -1362,6 +1392,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.letter_vep_width_box.setEnabled(not busy)
         self.letter_vep_refresh.setEnabled(not busy and self.output is not None and has_results)
         self.letter_vep_trials.setEnabled(not busy and self.output is not None and has_results)
+        self.letter_vep_copy.setEnabled(not busy and self._event_plot_copy_ready())
         self.tabs.setEnabled(not busy)
         self.similarity_parameter_box.setEnabled(not busy)
         self.similarity_button.setEnabled(not busy and self.output is not None and not self._parameters_dirty
