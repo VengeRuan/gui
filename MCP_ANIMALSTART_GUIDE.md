@@ -36,12 +36,12 @@
 ## 工作站启用
 
 1. 更新整套项目并保存结果、重启Qt程序，不热替换正在计算的模块。
-2. 工作站`conda activate GUI`后运行`python -m pip install -r requirements-mcp.txt`。可选依赖，关闭MCP时不需要。
+2. 工作站`conda activate GUI`后，在项目目录运行`python -m venv --system-site-packages .venv-mcp`，再运行`.venv-mcp\Scripts\python.exe -m pip install -r requirements-mcp.txt`。SDK位于专用环境，不修改原科学计算环境；关闭MCP时不需要。
 3. 测试窗口中设置专用“MCP导出根目录”，勾选“允许MCP控制”，记录会话编号。
 4. 仅监听`127.0.0.1`随机端口。凭据位于当前账号`%LOCALAPPDATA%\SD_BIN_Analysis\mcp_sessions`，ACL仅当前账号、SYSTEM和Administrators。不要上传该目录。
 5. SSH和GUI必须使用同一Windows账号；不同账号看不到相同注册目录。不要把SSH密码写入脚本。
 
-`start_animal_peak_mcp.cmd`默认使用`D:\software\Anaconda\envs\GUI\python.exe`，也可用`ANIMAL_PEAK_MCP_PYTHON`指定解释器，不依赖非交互SSH的conda激活。
+`start_animal_peak_mcp.cmd`优先使用项目下`.venv-mcp\Scripts\python.exe`，不存在时使用`D:\software\Anaconda\envs\GUI\python.exe`；也可用`ANIMAL_PEAK_MCP_PYTHON`指定解释器，不依赖非交互SSH的conda激活。
 
 ## 本机桌面客户端
 
