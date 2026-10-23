@@ -37,7 +37,7 @@ CONTROLS = {
         q="secondary_q", low_hz="secondary_low", high_hz="secondary_high", order="secondary_order"),
     "view": dict(global_y_min="y_min_spin", global_y_max="y_max_spin", event_y_min="letter_vep_y_min",
         event_y_max="letter_vep_y_max", event_width_px="letter_vep_width", letter_before_ms="letter_view_spin",
-        details_per_page="details_per_page_box", detail_curve="detail_curve_box",
+        trial_range_mode="trial_range_box", details_per_page="details_per_page_box", detail_curve="detail_curve_box",
         manual_average_visible="manual_average_check", manual_pick_enabled="manual_pick_check",
         parameters_expanded="parameter_toggle", individual_png="individual_check"),
     "manual": dict(relative_ms="manual_time_spin"),
@@ -126,7 +126,7 @@ class AnimalPeakController:
             trial=d.manual_trial_box.currentData(), branch=d.manual_branch_box.currentData(),
             reference=d.similarity_reference_box.currentData(), ranked=d.similarity_trial_box.currentData(),
             similarity_tab=d.similarity_views.currentIndex(), applied_display=(d._fixed_y_limits,
-                d._event_y_override, d._event_plot_width, d._letter_before_ms),
+                d._event_y_override, d._event_plot_width, d._letter_before_ms, d._trial_range_mode),
             exported=(d._exported_manual_actions, d._exported_window_resizes, d._exported_average_selections,
                       d._exported_secondary_filters, d._exported_letter_revision)))
         fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).digest()
@@ -299,6 +299,7 @@ class AnimalPeakController:
         elif group == "manual":
             d._preview_manual_point()
         elif group == "view":
+            if set(values) & {"trial_range_mode", "letter_before_ms"}: d._trial_range_pending()
             if "details_per_page" in values: d._detail_layout_changed()
             elif "detail_curve" in values: d.render_details()
             if "parameters_expanded" in values: d._toggle_parameters(values["parameters_expanded"])

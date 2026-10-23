@@ -67,6 +67,7 @@ from qt_data_model import (
     LazyH5Source,
     filter_array,
     parse_alignment_log,
+    AlignmentSegmentSelectionRequired,
     read_channel_layout,
     read_channel_remap,
     read_channel_remap_for_ids,
@@ -10191,7 +10192,7 @@ class QtAnalysisGUI(QMainWindow):
         try:
             if not hasattr(self, "_alignment_use_all_healthy"):
                 self._alignment_use_all_healthy = not bool(getattr(self, "alignment_selected_ids", set()))
-            self.alignment_selected_ids = self._alignment_channel_ids(self.active_source)
+            selected_channel_ids = self._alignment_channel_ids(self.active_source)
         except ValueError as exc:
             QMessageBox.information(self, "对齐健康通道", str(exc))
             return
@@ -10202,13 +10203,31 @@ class QtAnalysisGUI(QMainWindow):
             return
         try:
             meta = self.active_source.metadata
-            timing = parse_alignment_log(
-                log_path, float(self.bin_timing_metadata.get("deltaT1_sec", 0.0) or 0.0)
-            )
+            try:
+                timing = parse_alignment_log(
+                    log_path, float(self.bin_timing_metadata.get("deltaT1_sec", 0.0) or 0.0)
+                )
+            except AlignmentSegmentSelectionRequired as choice:
+                labels = []
+                for segment in choice.segments:
+                    duration = (f"{segment['program_duration_sec']:.3f} s"
+                                if segment["program_segment_complete"] else "结束时间未记录")
+                    labels.append(f"第 {segment['program_segment_index']} 段：{segment['stim_start_text']} → "
+                                  f"{segment['stim_end_text'] or '未记录 END'}；{duration}；"
+                                  f"Recording ON={segment['rec_start_text']}")
+                selected, accepted = QInputDialog.getItem(self, "选择任务时间段",
+                    f"TXT 检测到 {len(labels)} 个任务时段，请选择与当前 Event CSV 对应的一段。\n"
+                    "使用所选 PROGRAM_START 计算对齐延迟；PROGRAM_END 用于核对时段，不裁剪 CSV 或脑电数据。",
+                    labels, 0, False)
+                if not accepted:
+                    self.alignment_status.setText("已取消任务时段选择；未重新计算对齐，原结果保留。")
+                    return
+                timing = dict(choice.segments[labels.index(selected)])
             task_mode = self.alignment_task_mode_var.currentText()
             letter_annotations = {}
             markers = build_task_markers(event_path, timing, meta.fs, task_mode,
                                          letter_annotations=letter_annotations)
+            self.alignment_selected_ids = selected_channel_ids
             self.letter_csv_annotations = letter_annotations
             self.timing_info = timing
             self.stim_markers = markers
@@ -10263,9 +10282,13 @@ class QtAnalysisGUI(QMainWindow):
                           for cue in letter_annotations.values() if cue["tag100_status"] != "csv"]
             cue_text = (f"\nTag100黑区：CSV同行M列起点，固定持续2 s；{len(cue_errors)} 条提示。"
                         + ("\n" + "\n".join(cue_errors) if cue_errors else "")) if task_mode == "Letter" else ""
+            segment_duration = (f"持续 {timing['program_duration_sec']:.3f} s"
+                                if timing["program_segment_complete"] else "结束时间未记录")
             self.alignment_results.setPlainText(
                 f"{task_mode} 对齐完成\nRecording ON: {timing['rec_start_text']}\n"
                 f"PROGRAM_START: {timing['stim_start_text']}\n"
+                f"选用任务时段：第 {timing['program_segment_index']}/{timing['program_segment_count']} 段；"
+                f"PROGRAM_END: {timing['stim_end_text'] or '未记录'}；{segment_duration}\n"
                 f"原始延迟：{timing['stim_delay_raw_sec']:.6f} s\n"
                 f"deltaT1：{timing['deltaT1_sec']:.6f} s\n"
                 f"校正后刺激延迟：{timing['stim_delay_sec']:.6f} s\n"
@@ -11763,7 +11786,8 @@ class QtAnalysisGUI(QMainWindow):
         if unavailable:
             raise ValueError("上次对齐的这些通道已不存在或不再属于健康通道："
                              + ",".join(map(str, unavailable)) + "。请在第三页重新选择并计算对齐。")
-        context_key = (id(source), id(self.stim_markers), id(self.behavior_matches), tuple(selected_ids))
+        context_key = (id(source), id(self.stim_markers), id(getattr(self, "behavior_matches", None)),
+                       id(getattr(self, "letter_csv_annotations", None)), tuple(selected_ids))
         return source, selected_ids, context_key
 
     def open_animal_peak_test(self) -> None:
@@ -11771,10 +11795,12 @@ class QtAnalysisGUI(QMainWindow):
         if not hasattr(self, "stim_markers") or getattr(self, "stim_marker_mode", None) != "Letter":
             QMessageBox.information(self, "需要 Letter 对齐", "请先加载 LFP 数据，并在时间对齐页生成 Letter markers。")
             return
-        matches = getattr(self, "behavior_matches", {})
-        if not matches:
-            QMessageBox.information(self, "缺少 AnimalStart 信息", "请在时间对齐页导入对应行为检测结果并计算对齐，获得 AnimalStart 时间。")
-            return
+        behavior = getattr(self, "behavior_matches", {}) or {}
+        annotations = getattr(self, "letter_csv_annotations", {}) or {}
+        # CSV Dot timings remain usable even when no behavior TXT was supplied.
+        # Do not manufacture AnimalStart or a validity flag from these cues.
+        matches = {int(sample): {**annotations.get(sample, {}), **behavior.get(sample, {})}
+                   for sample in set(annotations) | set(behavior)}
         try:
             source, selected_ids, context_key = self._animal_peak_alignment_context()
         except ValueError as exc:

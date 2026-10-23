@@ -10,6 +10,8 @@ from animal_peak_analysis import _animal_exclusion, _check, _condition_channel, 
 
 
 ALIGNMENTS = {"letter": "LetterStart", "dot": "Dot", "animal": "AnimalStart"}
+EVENT_COLORS = {"dot": "#555555", "letter": "#c62828", "animal": "#9467bd"}
+EVENT_MARKER_HINT = "细线：Dot灰 / Letter红 / Animal紫"
 DEFAULTS = dict(alignment="letter", start_ms=0., end_ms=6000., baseline_enabled=True,
                 baseline_start_ms=-1000., baseline_end_ms=0.)
 
@@ -64,7 +66,7 @@ def selected_ids(state, pair):
 
 
 def trial_catalog(source, output, state, pair, config=None):
-    """Keep global Trial IDs; AnimalStart validity does not depend on peak success."""
+    """Check the chosen anchor independently when AnimalStart is unavailable."""
     cfg = parameters(config or state["parameters"])
     mode = cfg["alignment"]; name = ALIGNMENTS[mode]
     channel, wanted_tag = map(int, pair)
@@ -99,6 +101,13 @@ def trial_catalog(source, output, state, pair, config=None):
             elif not 0 <= animal < meta.rows:
                 code, reason = "animal_outside_source", "AnimalStart超出当前源数据范围"
         animal_valid = not bool(reason)
+        animal_code, animal_reason = code, reason
+        validity = str(event.get("validity") or "").strip().upper() if event else ""
+        animal_missing = (not np.isfinite(latency) and validity in {"", "Y", "NA", "NAN", "NONE"}
+                          and code not in {"animal_frame_equal_start", "animal_frame_before_start"})
+        selection_eligible = animal_valid or animal_missing
+        if mode != "animal" and animal_missing:
+            code, reason = "", ""  # Letter/Dot have their own independent anchors.
         anchor_sample = sample
         anchor_event_sec = sample/fs
         if mode == "animal":
@@ -120,7 +129,10 @@ def trial_catalog(source, output, state, pair, config=None):
                    alignment=mode, alignment_sample=anchor_sample, alignment_event_sec=anchor_event_sec,
                    alignment_sec=anchor_sample/fs if anchor_sample is not None else np.nan,
                    baseline_reference=baseline_reference(cfg), baseline_anchor_sample=baseline_sample,
-                   animal_valid=animal_valid, average_selected=animal_valid and (chosen is None or trial_id in chosen),
+                   animal_valid=animal_valid, animal_missing=animal_missing,
+                   animal_reason_code=animal_code, animal_reason=animal_reason,
+                   selection_eligible=selection_eligible,
+                   average_selected=selection_eligible and (chosen is None or trial_id in chosen),
                    first=center+first if center is not None else None, last=center+last if center is not None else None,
                    baseline_first=baseline_center+base_first if baseline_center is not None else None,
                    baseline_last=baseline_center+base_last if baseline_center is not None else None,
@@ -136,12 +148,33 @@ def trial_catalog(source, output, state, pair, config=None):
     return rows, np.arange(first, last, dtype=np.float64)/fs*1000
 
 
+def selection_eligible(row):
+    """Shared choices survive switching to a mode whose anchor is missing."""
+    return row.get("selection_eligible", row.get("animal_valid", False))
+
+
+def trial_status_text(row):
+    if row["reason"]:
+        return row["reason"]
+    if row.get("animal_missing"):
+        return f"AnimalStart缺失：{row['animal_reason']}；本模式仍可计算"
+    return "可用"
+
+
+def animal_plot_unavailable(group):
+    """Missing anchors are not a drawable zero; keep legacy explicit-empty previews."""
+    rows = group["records"]
+    return (group["parameters"].get("alignment") == "animal"
+            and not any(r["animal_valid"] and r["average_selected"] for r in rows)
+            and (any(r["average_selected"] for r in rows) or not any(r["animal_valid"] for r in rows)))
+
+
 def set_selection(state, group, trial_ids):
     pair = (group["channel"], group["tag"])
-    available = {row["trial_id"] for row in group["records"] if row["animal_valid"]}
+    available = {row["trial_id"] for row in group["records"] if selection_eligible(row)}
     chosen = available if trial_ids is None else set(map(int, trial_ids))
     if chosen-available:
-        raise ValueError("选择包含不属于当前通道/Tag或AnimalStart无效的Trial。")
+        raise ValueError("选择包含不属于当前通道/Tag或明确无效的Trial。")
     value = None if chosen == available else tuple(sorted(chosen))
     if value == selected_ids(state, pair):
         return state
@@ -241,9 +274,10 @@ def manifest(state):
                 configurations=configurations(state), history=state["history"], revision=state["revision"],
                 alignment="letter=CSV N corrected marker; dot=CSV same-row M corrected time (never TXT Tag100); animal=matched AnimalStart. Anchors rounded to source samples, no extrema/manual-anchor alignment.",
                 baseline="Dot alignment: relative to Dot. Letter and AnimalStart alignment: relative to LetterStart. Default -1000..0 ms, optional; each saved mode records its applied offsets.",
-                eligibility="AnimalStart validity Y, finite latency, inside original Letter Epoch and loaded source; complete VEP and optional baseline windows; no peak/search/similarity requirement",
+                eligibility="Animal mode requires valid AnimalStart inside the original Letter Epoch and source. Missing AnimalStart alone does not exclude Letter/Dot modes; explicit invalidity and known bad Animal timing remain excluded. Each mode requires its own anchor, complete source and optional baseline windows; no fabricated anchors, peak/search/similarity requirement.",
                 waveform="Current loaded / secondary-filtered source with committed task conditioning; no localization trend; optional per-Trial baseline subtraction",
                 selection="One channel/Tag Trial list SHARED by all three event alignments; unspecified=all eligible, explicit empty=none. Independent of peak/trough and legacy AnimalStart reference averages.",
+                event_time_markers="One thin line per actually averaged Trial and other event within the displayed sample-time window. Letter=marker, Dot=CSV M only, Animal=matched latency; all rounded to source samples relative to the current alignment sample. The aligned event has one shared zero line. No changes to waves, selection, baseline or mean.",
                 export="All successfully refreshed modes and all channel/Tag groups; shared selection applied to every mode at export. Legacy letter_start_vep directory/key retained for compatibility; mode-specific file names.")
 
 
@@ -259,7 +293,9 @@ def reference_span_ms(source, output, pair, trial_id=None):
             first, last = _trial_detail_bounds(source, output, rows)
             span = max(1., (last-first-1)/float(output["fs"])*1000)
             # Same approximate 5% right / 10% two-sided margin as trial plots.
-            margin = 1.05 if output.get("display_settings", {}).get("letter_before_ms") is not None else 1.10
+            from animal_peak_plotting import trial_display_mode
+            margin = (1. if trial_display_mode(output) == "dot_animal" else
+                      1.05 if output.get("display_settings", {}).get("letter_before_ms") is not None else 1.10)
             return span*margin, chosen
         except (KeyError, ValueError):
             pass
@@ -278,6 +314,54 @@ def compact_plot_size(duration_ms, reference_ms, cell_width, cell_height, paddin
     return min(cell_width, max(minimum_width, target)), float(cell_height)
 
 
+def event_time_markers(group, fs):
+    """Display-only timestamps shared by the Qt plot and saved figures.
+
+    Sample differences deliberately cancel the loaded source's time offset.
+    Only selected, successfully read waves can contribute markers; absent
+    CSV Dot metadata suppresses that marker, never the Trial's other events.
+    """
+    mode = group["parameters"].get("alignment", "letter")
+    low, high = float(group["time_ms"][0]), float(group["time_ms"][-1])
+    fs = float(fs)
+    markers = []
+    for index in group["selected_indices"]:
+        row = group["rows"][index]
+        if row.get("status", "included") != "included" or not row.get("average_included", True):
+            continue
+        try:
+            letter_sample = float(row["marker_sample"])
+            if not np.isfinite(letter_sample):
+                continue
+            samples = {"letter": round(letter_sample)}
+            try:
+                latency = float(row.get("animal_latency_ms", np.nan))/1000
+                if row.get("animal_valid", True) and np.isfinite(latency):
+                    samples["animal"] = round(letter_sample+latency*fs)
+            except (TypeError, ValueError):
+                pass
+            if row.get("tag100_source") == "csv" and row.get("tag100_status") == "csv":
+                try:
+                    dot_sec = float(row["tag100_start_eeg_sec"])
+                    if np.isfinite(dot_sec):
+                        samples["dot"] = round(dot_sec*fs)
+                except (KeyError, TypeError, ValueError):
+                    pass
+            anchor = row.get("alignment_sample", samples.get(mode))
+            if anchor is None or not np.isfinite(anchor):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        for event in ("dot", "letter", "animal"):
+            if event == mode or event not in samples:
+                continue
+            relative_ms = (samples[event]-anchor)/fs*1000
+            if low <= relative_ms <= high:
+                markers.append(dict(event=event, trial_id=row["trial_id"],
+                                    relative_ms=float(relative_ms), sample=samples[event]))
+    return markers
+
+
 def draw_group(axis, output, group):
     from animal_peak_plotting import apply_waveform_y_limits, waveform_display
     scale, unit = waveform_display(output)
@@ -285,11 +369,18 @@ def draw_group(axis, output, group):
     if indices:
         axis.plot(t, group["waves"][indices].T*scale, color=".6", alpha=.22, linewidth=.5)
         axis.plot(t, group["mean"]*scale, color="#b32025", linewidth=1.8)
-    axis.axvline(0, color="#c62828", linewidth=1)
     cfg = group["parameters"]
+    mode = cfg.get("alignment", "letter")
+    for marker in event_time_markers(group, output["fs"]):
+        line = axis.axvline(marker["relative_ms"], color=EVENT_COLORS[marker["event"]],
+                           linewidth=.6, linestyle="--", alpha=.55, zorder=1.5)
+        line._vep_event_marker = marker
+        line.set_gid(f"trial_event:{marker['trial_id']}:{marker['event']}")
+    zero = axis.axvline(0, color=EVENT_COLORS[mode], linewidth=1, zorder=1.6)
+    zero.set_gid("event_alignment_zero")
     name = ALIGNMENTS[cfg["alignment"]]
     baseline = f"基线相对{baseline_reference(cfg)} {cfg['baseline_start_ms']:g}～{cfg['baseline_end_ms']:g} ms" if cfg["baseline_enabled"] else "未做基线校正"
-    axis.set(title=f"ch{group['channel']} | Tag {group['tag']} | n={len(indices)}\n{name}对齐 VEP" + ("（无所选可用Trial）" if not indices else "") + f"\n{baseline}",
+    axis.set(title=f"ch{group['channel']} | Tag {group['tag']} | n={len(indices)}\n{name}对齐 VEP" + ("（无所选可用Trial）" if not indices else "") + f"\n{baseline}\n{EVENT_MARKER_HINT}",
              xlabel=f"相对 {name}（ms）", ylabel=unit, xlim=(t[0], t[-1]))
     axis.title.set_fontsize(8)
     axis.grid(alpha=.15)
@@ -342,6 +433,13 @@ def export_results(source, output, folder, combined_pdf=None, progress=None, can
                 for n, values in enumerate(zip(group["time_ms"], group["mean"], group["sem"], group["valid_count"])):
                     if n % 1024 == 0: _check(cancel)
                     csv_writer.writerow([*values, output["units"], *pair, mode])
+            if mode == "animal" and not group["selected_indices"]:
+                # Keep the audit data/reasons, but do not save an empty Animal
+                # figure or add a placeholder page to either combined PDF.
+                if progress:
+                    progress((index+1)/max(1,len(jobs))*100, f"跳过AnimalStart图：ch{pair[0]} / Tag {pair[1]}（无有效AnimalStart）")
+                del group
+                continue
             span, _ = reference_span_ms(source, output, pair)
             size = compact_plot_size(np.ptp(group["time_ms"]), span, 6, 5, padding=.85, minimum_width=2.8)
             plot_display = output.get("display_settings", {}).get("event_vep_plot", {})

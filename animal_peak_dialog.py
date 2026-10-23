@@ -23,7 +23,7 @@ import animal_peak_letter_vep as letter_vep
 
 from animal_peak_analysis import (
     AnalysisCancelled, analyze_animal_peaks, export_animal_peak_results, trial_detail_trace,
-    _condition_channel, trial_detail_localization,
+    _condition_channel, trial_detail_localization, TrialDisplayRangeError, DOT_DISPLAY_LEAD_MS,
 )
 
 
@@ -99,7 +99,7 @@ class AverageTrialSelectionDialog(QtWidgets.QDialog):
         self.setWindowFlags(self.windowFlags() | flags.WindowMaximizeButtonHint | flags.WindowMinimizeButtonHint)
         layout = QtWidgets.QVBoxLayout(self)
         self._letter_selection = letter_group is not None
-        hint = QtWidgets.QLabel("LetterStart、Dot和AnimalStart事件对齐共用此名单，与峰谷页独立。需有效AnimalStart；当前模式截取、基线或Dot时间不完整时不纳入，原因保留，但选择保留供其他模式使用。全不选不会自动恢复全选。" if self._letter_selection else "本组峰、谷及 AnimalStart 对照使用同一份选择，只影响平均与导出；不删除 Trial、不改变点位、不改变全组判断窗相似度。这里只列已有定位点的 Trial，缺少 AnimalStart/定位点的不能参与平均。全不选时不绘制平均线，不会自动恢复全选。")
+        hint = QtWidgets.QLabel("三种事件对齐共用此名单，与峰谷页独立。AnimalStart缺失时仍可选择Letter/Dot；仅Animal模式要求有效AnimalStart。当前模式时间、截取或基线不完整时跳过，原因及选择保留供其他模式使用；明确无效的Trial仍排除。全不选不会恢复全选。" if self._letter_selection else "本组峰、谷及 AnimalStart 对照使用同一份选择，只影响平均与导出；不删除 Trial、不改变点位、不改变全组判断窗相似度。这里只列已有定位点的 Trial，缺少 AnimalStart/定位点的不能参与平均。全不选时不绘制平均线，不会自动恢复全选。")
         hint.setWordWrap(True); layout.addWidget(hint)
         toolbar = QtWidgets.QHBoxLayout()
         self.select_all_button = QtWidgets.QPushButton("全选")
@@ -125,7 +125,7 @@ class AverageTrialSelectionDialog(QtWidgets.QDialog):
             item = QtWidgets.QTableWidgetItem()
             item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setData(role, int(trial))
-            if self._letter_selection and not branches["letter"]["animal_valid"]:
+            if self._letter_selection and not letter_vep.selection_eligible(branches["letter"]):
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable)
                 chosen.discard(trial)
             item.setCheckState(QtCore.Qt.CheckState.Checked if trial in chosen else QtCore.Qt.CheckState.Unchecked)
@@ -133,7 +133,7 @@ class AverageTrialSelectionDialog(QtWidgets.QDialog):
             first = next(iter(branches.values()))
             texts = [trial, first["tag_trial_id"]]
             if self._letter_selection:
-                texts.extend([f"{first['alignment_sec']:.6f}", first["reason"] or "可用", f"{first['baseline_correction']:.6g}"])
+                texts.extend([f"{first['alignment_sec']:.6f}", letter_vep.trial_status_text(first), f"{first['baseline_correction']:.6g}"])
             else:
                 for branch in ("peak", "trough"):
                     row = branches.get(branch)
@@ -238,6 +238,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._mcp_bridge = None
         self._mcp_discard_close = False
         self._letter_before_ms = min(60000, max(0, -float(defaults["epoch_start_ms"])))
+        self._trial_range_mode = "dot_animal"
         self._parameters_dirty = False
         self._other_parameters_dirty = False
         self._window_parameters_dirty = False
@@ -374,6 +375,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.cancel_button = QtWidgets.QPushButton("取消当前操作"); self.cancel_button.setEnabled(False)
         self.cancel_button.setMinimumWidth(120); self.cancel_button.setMinimumHeight(32)
         self.export_button = QtWidgets.QPushButton("保存完整结果（图 + 明细 + 数据）"); self.export_button.setEnabled(False)
+        self.export_button.setToolTip("保存事件对齐图、AnimalStart对照图、逐Trial详情和明细/数据；不保存最大峰/最小谷平均图及峰时/谷时分布图，峰谷CSV/NPZ数据仍保留。")
         self.individual_check = QtWidgets.QCheckBox("同时保存每个 trial 的独立 PNG"); self.individual_check.setChecked(True)
         for widget in (self.run_button, self.export_button, self.individual_check):
             row.addWidget(widget)
@@ -430,13 +432,20 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         layout.addWidget(self.y_axis_box)
         self.y_fixed_button.clicked.connect(self.apply_fixed_y_axis)
         self.y_auto_button.clicked.connect(self.restore_auto_y_axis)
-        self.letter_view_box = QtWidgets.QGroupBox("Letter 红线前的查看范围（不改变搜索或平均）")
+        self.letter_view_box = QtWidgets.QGroupBox("Trial 子图查看范围（不改变搜索或平均）")
         letter_view_row = QtWidgets.QHBoxLayout(self.letter_view_box)
+        self.trial_range_box = QtWidgets.QComboBox()
+        self.trial_range_box.addItem("Dot 前 2 秒 → AnimalStart 结束（默认）", "dot_animal")
+        self.trial_range_box.addItem("Letter 前指定长度（原方式）", "letter")
+        self.trial_range_box.setToolTip("逐 Trial 子图及对应导出从 CSV Dot 起点前 2000 ms 显示到 AnimalStart；不改变真实 Dot 黑色提示区或计算，不使用 TXT Tag100。")
         self.letter_view_spin = self._spin(self._letter_before_ms, 0, 60000)
+        self.letter_view_spin.setEnabled(False)
         self.letter_view_spin.setToolTip("所有通道、Tag、Trial 统一从 Letter 开始前指定毫秒数显示；可读取 Epoch 之前仍存在的数据。仅用于查看和导出，不重找点、不改变基线/平均/相似度。")
         self.letter_view_button = QtWidgets.QPushButton("刷新所有 Trial 显示范围")
-        self.letter_view_status = QtWidgets.QLabel(f"当前：Letter 前 {self._letter_before_ms:g} ms；源数据不足时显示到数据起点。")
+        self.letter_view_status = QtWidgets.QLabel("当前：CSV Dot 前 2 秒 → AnimalStart 结束；源数据不足时显示到数据起点。")
         self.letter_view_status.setWordWrap(True)
+        letter_view_row.addWidget(QtWidgets.QLabel("显示方式"))
+        letter_view_row.addWidget(self.trial_range_box)
         letter_view_row.addWidget(QtWidgets.QLabel("Letter 开始前显示 ms"))
         letter_view_row.addWidget(self.letter_view_spin)
         letter_view_row.addWidget(self.letter_view_button)
@@ -445,8 +454,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         layout.addLayout(selection)
         layout.addWidget(self.summary)
         self.letter_view_button.clicked.connect(self.apply_letter_display_range)
-        self.letter_view_spin.valueChanged.connect(lambda *_: self.letter_view_status.setText(
-            f"待刷新：输入 {self.letter_view_spin.value():g} ms；当前已应用 Letter 前 {self._letter_before_ms:g} ms。"))
+        self.letter_view_spin.valueChanged.connect(self._trial_range_pending)
+        self.trial_range_box.currentIndexChanged.connect(self._trial_range_pending)
         self.tabs = CurrentPageTabs(); layout.addWidget(self.tabs, 1)
         self.average_plots = self._plot_tab("峰 / 谷叠加平均", 1, 2)
         average_layout = self.tabs.widget(0).layout()
@@ -575,6 +584,17 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.processing_check.toggled.connect(self.parameters_changed)
         self._localization_changed()
         self._build_mcp_controls(layout)
+        if not any(self._has_valid_animal_time(event) for event in self.matches.values()):
+            self.tabs.setCurrentWidget(self.letter_vep_page)
+            self._letter_selector_active = True
+            self.status.setText("未提供有效AnimalStart：仍可先提取/准备结果，再计算LetterStart、Dot平均；依赖AnimalStart的图跳过，不补造时间。")
+
+    @staticmethod
+    def _has_valid_animal_time(event):
+        try:
+            return event.get("validity") == "Y" and np.isfinite(float(event.get("animal_latency_sec", np.nan)))
+        except (TypeError, ValueError):
+            return False
 
     def _build_mcp_controls(self, layout):
         box = QtWidgets.QGroupBox("MCP 自动化控制（默认关闭；仅控制此测试窗口）")
@@ -641,7 +661,10 @@ class AnimalPeakDialog(QtWidgets.QDialog):
     def _sync_y_axis_display(self):
         unit = "μV" if self.output is None or self.output["units"] == "mV" else "z"
         self.y_unit_label.setText(unit)
-        display = {"y_axis_mode": "auto", "y_unit": unit, "letter_before_ms": self._letter_before_ms}
+        display = {"y_axis_mode": "auto", "y_unit": unit, "letter_before_ms": self._letter_before_ms,
+                   "trial_range_mode": self._trial_range_mode}
+        if self._trial_range_mode == "dot_animal":
+            display["trial_dot_before_ms"] = DOT_DISPLAY_LEAD_MS
         if self._fixed_y_limits is not None:
             low, high = self._fixed_y_limits
             display.update(y_axis_mode="fixed", y_min=low, y_max=high)
@@ -680,12 +703,22 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                 view.setLimits(yMin=low, yMax=high, minYRange=high-low, maxYRange=high-low)
                 view.setMouseEnabled(y=False); view.setYRange(low, high, padding=0)
 
+    def _trial_range_pending(self, *_):
+        mode = self.trial_range_box.currentData()
+        self.letter_view_spin.setEnabled(mode == "letter")
+        requested = (f"Letter 前 {self.letter_view_spin.value():g} ms" if mode == "letter"
+                     else "CSV Dot 前 2 秒 → AnimalStart 结束")
+        self.letter_view_status.setText(f"待刷新：{requested}；点击“刷新所有 Trial 显示范围”应用。")
+
     def apply_letter_display_range(self):
         if self._busy:
             return
         self._letter_before_ms = self.letter_view_spin.value()
+        self._trial_range_mode = self.trial_range_box.currentData()
         self._sync_y_axis_display()
-        self.letter_view_status.setText(f"当前：Letter 前 {self._letter_before_ms:g} ms，所有 Trial 统一；源数据不足时显示到数据起点。")
+        description = (f"Letter 前 {self._letter_before_ms:g} ms，所有 Trial 统一"
+                       if self._trial_range_mode == "letter" else "CSV Dot 前 2 秒 → AnimalStart 结束，逐 Trial 使用各自时间")
+        self.letter_view_status.setText(f"当前：{description}；源数据不足时显示到数据起点。")
         if self.output is not None and self._current_pair() is not None:
             pending = self.manual_time_spin.value() if self._manual_preview is not None else None
             self.render_details()
@@ -891,7 +924,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self.letter_vep_base_start.setEnabled(enabled); self.letter_vep_base_end.setEnabled(enabled)
         reference = letter_vep.baseline_reference({"alignment": mode})
         self.letter_vep_baseline.setText(f"启用基线校正（相对{reference}）")
-        self.letter_vep_hint.setText(f"零点={letter_vep.ALIGNMENTS[mode]}；基线相对{reference}；要求有效AnimalStart；三种对齐共用名单，不使用峰谷点或趋势线。")
+        requirement = "要求有效AnimalStart" if mode == "animal" else "AnimalStart缺失不影响此模式；仍保留明确无效Trial的排除"
+        self.letter_vep_hint.setText(f"零点={letter_vep.ALIGNMENTS[mode]}；基线相对{reference}；{requirement}；三种对齐共用名单，不使用峰谷点或趋势线。")
         self.letter_vep_duration.setToolTip("总长度=终点−起点；AnimalStart保持终点、向前调整起点，其余保持起点、向后调整终点。点击刷新重新截取并平均，保留共用Trial名单，不改变峰谷页。")
         self._render_letter_vep()
 
@@ -963,6 +997,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         state = self.output.get("letter_vep") if self.output is not None else None
         group = state.get("cache") if state else None
         return (group is not None and not state.get("stale")
+                and not letter_vep.animal_plot_unavailable(group)
                 and (group["channel"], group["tag"]) == self._current_pair()
                 and group["parameters"].get("alignment", "letter") == self.letter_vep_alignment.currentData())
 
@@ -1000,11 +1035,29 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         for index in indices:
             plot.plot(t, group["waves"][index]*scale, pen=pg.mkPen((120,130,140,65), width=.7))
         if indices: plot.plot(t, group["mean"]*scale, pen=pg.mkPen("#b32025", width=2.2))
-        plot.addItem(pg.InfiniteLine(0, pen=pg.mkPen("#c62828", width=1.2)))
+        mode = group["parameters"].get("alignment", "letter")
+        no_animal = letter_vep.animal_plot_unavailable(group)
+        for marker in letter_vep.event_time_markers(group, self.output["fs"]):
+            color = pg.mkColor(letter_vep.EVENT_COLORS[marker["event"]]); color.setAlphaF(.55)
+            line = pg.InfiniteLine(marker["relative_ms"], pen=pg.mkPen(color, width=.6,
+                style=QtCore.Qt.PenStyle.DashLine if hasattr(QtCore.Qt, "PenStyle") else QtCore.Qt.DashLine))
+            line._vep_event_marker = marker
+            line.setZValue(-1)
+            plot.addItem(line, ignoreBounds=True)
+        if not no_animal:
+            zero = pg.InfiniteLine(0, pen=pg.mkPen(letter_vep.EVENT_COLORS[mode], width=1.2))
+            zero.setZValue(-1); plot.addItem(zero, ignoreBounds=True)
         plot.setXRange(float(t[0]), float(t[-1]), padding=0)
         name = letter_vep.ALIGNMENTS[group["parameters"].get("alignment", "letter")]
         plot.setLabel("bottom", f"相对 {name}", units="ms"); plot.setLabel("left", unit)
-        plot.setTitle(f"ch{group['channel']} | Tag {group['tag']} | n={len(indices)}<br>{name} 对齐 VEP" + ("（无所选可用Trial）" if not indices else ""))
+        plot.setTitle(f"ch{group['channel']} | Tag {group['tag']} | n={len(indices)}<br>{name} 对齐 VEP" + ("（无所选可用Trial）" if not indices else "")
+                      + f"<br><span style='font-size:8pt'>{letter_vep.EVENT_MARKER_HINT}</span>")
+        # PlotItem.setTitle reserves only 30 px, which clips a multi-line
+        # title/colour key in copied images. Fit the actual rendered text.
+        title = plot.plotItem.titleLabel
+        title_height = max(30, int(np.ceil(title.item.boundingRect().height()))+4)
+        title.setMaximumHeight(title_height)
+        plot.plotItem.layout.setRowFixedHeight(0, title_height)
         try: pending = self._letter_vep_config() != state["parameters"]
         except ValueError: pending = True
         cfg = group["parameters"]
@@ -1015,13 +1068,15 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         for index, row in enumerate(rows):
             values = [row["trial_id"], row["tag_trial_id"], "是" if row["average_selected"] else "否",
                 "是" if row["average_included"] else "否", f"{row['marker_sec']:.6f}", self._number(row["animal_latency_ms"]),
-                self._number(row["baseline_correction"]*scale), row["reason"], name,
+                self._number(row["baseline_correction"]*scale), letter_vep.trial_status_text(row), name,
                 self._number(row["alignment_sec"],6), row["baseline_reference"]]
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(value)); item.setToolTip(str(value)); self.letter_vep_table.setItem(index,column,item)
         self.letter_vep_table.resizeColumnsToContents(); self._apply_waveform_y_ranges()
         self._sync_event_plot_size()
-        self.letter_vep_copy.setEnabled(not self._busy)
+        if no_animal:
+            self.letter_vep_status.setText("无有效AnimalStart，本模式已跳过；可切换LetterStart/Dot继续计算，原Trial名单保留。")
+        self.letter_vep_copy.setEnabled(not self._busy and not no_animal)
 
     def _sync_event_plot_size(self):
         if not hasattr(self, "letter_vep_plot"):
@@ -1599,6 +1654,8 @@ class AnimalPeakDialog(QtWidgets.QDialog):
         self._detail_page = 0; self.render_pair()
         included = sum(row["status"] == "included" for row in output["records"])
         self.status.setText(f"测试完成：{len(output['eligible_trials'])} 个有效 AnimalStart trial；峰谷分支纳入 {included} 条记录，详情及排除原因已保留。")
+        if not output["eligible_trials"]:
+            self.status.setText(self.status.text()+" 可继续计算LetterStart/Dot；缺少AnimalStart的依赖图跳过。")
         self.progress.setValue(100)
         self.similarity_button.setEnabled(not self._busy and output["settings"].get("localization_mode") == "trend")
 
@@ -1976,12 +2033,18 @@ class AnimalPeakDialog(QtWidgets.QDialog):
                     if index >= len(shown):
                         continue
                     rows = details[shown[index]]
-                    self._manual_axes[axis] = rows
                     channel = rows[0]["channel"]
                     if self._detail_conditioned_channel != channel:
                         self._detail_conditioned = _condition_channel(self.source, rows[0]["column"], self.output["settings"])
                         self._detail_conditioned_channel = channel
-                    t, values = trial_detail_trace(self.source, self.output, rows, self._detail_conditioned)
+                    try:
+                        t, values = trial_detail_trace(self.source, self.output, rows, self._detail_conditioned)
+                    except TrialDisplayRangeError as exc:
+                        axis.set_title(f"ch{channel} | Tag {rows[0]['tag']} | 原 Trial {rows[0]['trial_id']}", fontsize=9)
+                        axis.text(.5, .5, str(exc), ha="center", va="center", wrap=True, transform=axis.transAxes)
+                        axis.set_xticks([]); axis.set_yticks([])
+                        continue
+                    self._manual_axes[axis] = rows
                     localization = trial_detail_localization(self.source, self.output, rows)
                     draw_trial_detail(axis, self.output, rows, t, values, localization, self.detail_curve_box.currentData())
             self.detail_toolbar.update()  # Discard zoom history from the previous page/tag.
@@ -2013,7 +2076,7 @@ class AnimalPeakDialog(QtWidgets.QDialog):
             except ValueError: letter_pending = True
             pending += "\n包含已刷新过的各事件对齐方式、全部通道/Tag、共用Trial名单及数据。"
             if letter_pending: pending += "\n事件对齐参数/方式待刷新：将导出已应用过的模式及其参数，不使用尚未刷新的输入值。"
-        answer = QtWidgets.QMessageBox.StandardButton.Yes if confirmed else QtWidgets.QMessageBox.question(self, "确认详细导出", f"将创建独立结果目录，保存 {len(details)} 个 trial×通道的找波详情、分页PDF、平均图、CSV、NPZ及参数。\n独立trial PNG：{'开启' if self.individual_check.isChecked() else '关闭'}。{pending}\n可能耗时并占用较多空间，是否继续？")
+        answer = QtWidgets.QMessageBox.StandardButton.Yes if confirmed else QtWidgets.QMessageBox.question(self, "确认详细导出", f"将创建独立结果目录，保存 {len(details)} 个 trial×通道的找波详情、分页PDF、事件/AnimalStart对照图、CSV、NPZ及参数。\n不保存最大峰/最小谷平均图及峰时/谷时分布图；峰谷数值数据仍保留。\n独立trial PNG：{'开启' if self.individual_check.isChecked() else '关闭'}。{pending}\n可能耗时并占用较多空间，是否继续？")
         yes = QtWidgets.QMessageBox.StandardButton.Yes if hasattr(QtWidgets.QMessageBox, "StandardButton") else QtWidgets.QMessageBox.Yes
         if answer != yes:
             return

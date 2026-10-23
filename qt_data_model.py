@@ -1005,8 +1005,21 @@ def remap_source_from_excel(
     return data, storage_path, mapping, source_ids, target_channel_ids
 
 
-def parse_alignment_log(path: str | Path, delta_t1_sec: float = 0.0) -> dict:
-    """Read Recording ON and PROGRAM_START times from the experiment log."""
+class AlignmentSegmentSelectionRequired(ValueError):
+    """Never silently choose a PROGRAM_START when a log contains several."""
+
+    def __init__(self, segments):
+        self.segments = segments
+        super().__init__(f"log.txt 包含 {len(segments)} 个任务时段，请明确选择用于对齐的一段。")
+
+
+def alignment_log_segments(path: str | Path, delta_t1_sec: float = 0.0) -> list[dict]:
+    """Pair each START with its following END and preceding Recording ON.
+
+    Missing END is retained and explicitly labelled for older/start-only
+    logs. A new START or Recording ON never borrows an END from an older run.
+    The existing timestamp extraction and deltaT1 correction are preserved.
+    """
     path = Path(path)
     text = None
     for encoding in ("utf-8-sig", "gbk", "utf-16"):
@@ -1017,29 +1030,64 @@ def parse_alignment_log(path: str | Path, delta_t1_sec: float = 0.0) -> dict:
             continue
     if text is None:
         text = path.read_text(errors="ignore")
-    found = {"rec_start_text": None, "stim_start_text": None}
+    segments = []
+    recording = None
+    recording_line = None
+    active = None
     lines = text.splitlines()
     for index, line in enumerate(lines):
         previous = lines[index - 1] if index else line
         if "Recording ON" in line:
-            found["rec_start_text"] = _extract_time(previous) or _extract_time(line)
+            recording = _extract_time(line) or _extract_time(previous)
+            recording_line = index + 1
+            active = None
         elif "PROGRAM_START" in line:
-            found["stim_start_text"] = _extract_time(line)
-    if not found["rec_start_text"] or not found["stim_start_text"]:
+            start = _extract_time(line)
+            if not recording or not start:
+                raise ValueError(f"log.txt 第 {index+1} 行 PROGRAM_START 缺少有效时间或前置 Recording ON。")
+            rec_seconds, stim_seconds = _clock_seconds(recording), _clock_seconds(start)
+            raw_delay = stim_seconds - rec_seconds
+            if raw_delay < 0:
+                raw_delay += 24 * 3600
+            active = dict(rec_start_text=recording, stim_start_text=start,
+                rec_start_sec=rec_seconds, stim_start_sec=stim_seconds,
+                stim_delay_raw_sec=raw_delay, deltaT1_sec=float(delta_t1_sec),
+                stim_delay_sec=raw_delay+float(delta_t1_sec),
+                recording_on_line=recording_line, program_start_line=index+1,
+                stim_end_text=None, stim_end_sec=None, program_end_line=None,
+                program_duration_sec=None, program_segment_complete=False)
+            segments.append(active)
+        elif "PROGRAM_END" in line and active is not None:
+            end = _extract_time(line)
+            if end:
+                end_seconds = _clock_seconds(end)
+                duration = end_seconds-active["stim_start_sec"]
+                if duration < 0:
+                    duration += 24 * 3600
+                active.update(stim_end_text=end, stim_end_sec=end_seconds,
+                    program_end_line=index+1, program_duration_sec=duration, program_segment_complete=True)
+            active = None
+    if not segments:
         raise ValueError("log.txt must contain Recording ON and PROGRAM_START timestamps.")
-    rec_seconds = _clock_seconds(found["rec_start_text"])
-    stim_seconds = _clock_seconds(found["stim_start_text"])
-    raw_delay = stim_seconds - rec_seconds
-    if raw_delay < 0:
-        raw_delay += 24 * 3600
-    found.update(
-        rec_start_sec=rec_seconds,
-        stim_start_sec=stim_seconds,
-        stim_delay_raw_sec=raw_delay,
-        deltaT1_sec=float(delta_t1_sec),
-        stim_delay_sec=raw_delay + float(delta_t1_sec),
-    )
-    return found
+    for index, segment in enumerate(segments):
+        segment.update(program_segment_index=index+1, program_segment_count=len(segments))
+    return segments
+
+
+def parse_alignment_log(path: str | Path, delta_t1_sec: float = 0.0, *, segment_index: int | None = None) -> dict:
+    """Read a single task segment, requiring explicit choice for ambiguous logs.
+
+    segment_index is zero-based for API callers; saved/displayed indices are
+    one-based. END is audit information, not a new EEG/CSV cropping rule.
+    """
+    segments = alignment_log_segments(path, delta_t1_sec)
+    if segment_index is None:
+        if len(segments) > 1:
+            raise AlignmentSegmentSelectionRequired(segments)
+        segment_index = 0
+    if isinstance(segment_index, bool) or not isinstance(segment_index, int) or not 0 <= segment_index < len(segments):
+        raise ValueError("任务时段序号无效。")
+    return dict(segments[segment_index])
 
 
 def build_flash_markers(path: str | Path, timing: dict, fs: float) -> np.ndarray:

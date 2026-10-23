@@ -391,8 +391,10 @@ class AnimalPeakAnalysisTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["settings"]["search_after_ms"], 100)
             self.assertTrue((folder/"ch7_tag4_trial00001_detail.png").is_file())
-            self.assertTrue((folder/"ch7_tag4_summary.png").is_file())
-            self.assertTrue((folder/"ch7_tag4_summary.pdf").is_file())
+            self.assertFalse(list(folder.glob("*_summary.png")))
+            self.assertFalse(list(folder.glob("*_summary.pdf")))
+            self.assertFalse(manifest["figure_exports"]["peak_trough_summary"])
+            self.assertFalse(manifest["figure_exports"]["peak_trough_latency_histograms"])
             with np.load(folder/"ch7_tag4_trial_traces_part001.npz") as trace:
                 self.assertEqual(trace["trial_ids"].tolist(), [1])
                 self.assertEqual(trace["tag"], 4)

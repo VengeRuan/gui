@@ -37,6 +37,10 @@ class AnimalPeakDialogTests(unittest.TestCase):
             self.window = QtAnalysisGUI("UI test")
         self.source, self.markers, self.matches, self.settings = fixture()
         self.dialog = AnimalPeakDialog(self.window, self.source, self.markers, self.matches, self.settings)
+        # Legacy detail tests intentionally exercise the retained Letter mode.
+        # The new default and CSV Dot interval have dedicated tests.
+        self.dialog.trial_range_box.setCurrentIndex(self.dialog.trial_range_box.findData("letter"))
+        self.dialog.apply_letter_display_range()
 
     def tearDown(self):
         if self.dialog.worker is not None and self.dialog.worker.isRunning():
@@ -331,7 +335,7 @@ class AnimalPeakDialogTests(unittest.TestCase):
         output["units"] = "z"
         self.dialog.analysis_finished(output)
         self.assertEqual(self.dialog.y_unit_label.text(), "z")
-        self.assertEqual(output["display_settings"], {"y_axis_mode": "fixed", "y_unit": "z", "y_min": -2, "y_max": 3, "letter_before_ms": 500})
+        self.assertEqual(output["display_settings"], {"y_axis_mode": "fixed", "y_unit": "z", "y_min": -2, "y_max": 3, "letter_before_ms": 500, "trial_range_mode": "letter"})
         self.dialog._set_busy(True)
         self.assertFalse(self.dialog.y_axis_box.isEnabled())
         self.dialog.restore_auto_y_axis()
@@ -505,11 +509,15 @@ class AnimalPeakDialogTests(unittest.TestCase):
         ), patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.StandardButton.Yes), patch.object(
             QtWidgets.QMessageBox, "warning",
         ) as warning:
-            self.dialog.start_export(); self.wait_for_worker()
+            self.dialog.export_button.click(); self.wait_for_worker()
             warning.assert_not_called()
             folders = list(Path(directory).glob("animal_peak_test_*"))
             self.assertEqual(len(folders), 1)
             self.assertTrue((folders[0]/"ch7_tag4_trial00001_detail.png").is_file())
+            self.assertFalse(list(folders[0].glob("*_summary.png")))
+            self.assertFalse(list(folders[0].glob("*_summary.pdf")))
+            self.assertTrue((folders[0]/"ch7_tag4_peak.npz").is_file())
+            self.assertTrue((folders[0]/"ch7_tag4_trough_average.csv").is_file())
 
     def test_main_button_opens_independent_parameters_without_mutation(self):
         window = self.window
@@ -575,6 +583,8 @@ class AnimalPeakDialogTests(unittest.TestCase):
         source, markers, matches, settings = trend_fixture()
         self.dialog.deleteLater(); self.app.processEvents()
         self.dialog = AnimalPeakDialog(self.window, source, markers, matches, settings)
+        self.dialog.trial_range_box.setCurrentIndex(self.dialog.trial_range_box.findData("letter"))
+        self.dialog.apply_letter_display_range()
         self.dialog.localization_box.setCurrentIndex(1)
         self.dialog.analysis_finished(analyze_animal_peaks(source, markers, matches, settings))
         self.dialog._set_busy(False)
@@ -793,6 +803,8 @@ class AnimalPeakDialogTests(unittest.TestCase):
         source, markers, matches, defaults = trend_fixture()
         self.dialog.deleteLater(); self.app.processEvents()
         self.dialog = AnimalPeakDialog(self.window, source, markers, matches, defaults)
+        self.dialog.trial_range_box.setCurrentIndex(self.dialog.trial_range_box.findData("letter"))
+        self.dialog.apply_letter_display_range()
         self.assertEqual(self.dialog.localization_box.currentData(), "raw")
         self.assertFalse(self.dialog.trend_spin.isEnabled())
         self.dialog.localization_box.setCurrentIndex(1)

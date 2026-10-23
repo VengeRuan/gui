@@ -32,6 +32,14 @@ def letter_display_before_ms(output):
     return value
 
 
+def trial_display_mode(output):
+    """Old saved results retain their original Letter-based display."""
+    mode = output.get("display_settings", {}).get("trial_range_mode", "letter")
+    if mode not in {"letter", "dot_animal"}:
+        raise ValueError("未知的 Trial 显示范围方式。")
+    return mode
+
+
 def draw_tag100_interval(axis, event, limits, *, origin_sec=0, time_scale=1):
     """Shared display-only cue shading for Letter seconds / AnimalStart ms.
 
@@ -111,6 +119,7 @@ def draw_trial_detail(axis, output, rows, time_ms, values, localization=None, di
     scale, unit = waveform_display(output)
     settings = output["settings"]
     first = rows[0]
+    strict_crop = trial_display_mode(output) == "dot_animal"
     search_start_ms = (first["search_first"] - first["animal_local_sample"]) / output["fs"] * 1000
     search_end_ms = (first["search_last"] - first["animal_local_sample"]) / output["fs"] * 1000
     similarity_group, judgment, similarity = judgment_info(output, first)
@@ -147,9 +156,11 @@ def draw_trial_detail(axis, output, rows, time_ms, values, localization=None, di
             if display_mode == "overlay":
                 axis.scatter([position], [row["localization_amplitude"] * scale], marker="D",
                              facecolors="none", edgecolors=color, s=25, zorder=4)
-                visible_values.append(np.asarray([row["localization_amplitude"]]))
+                if not strict_crop or time_ms[0] <= position <= time_ms[-1]:
+                    visible_values.append(np.asarray([row["localization_amplitude"]]))
         axis.scatter([position], [marker_value * scale], color=color, s=22, zorder=3)
-        visible_values.append(np.asarray([marker_value]))
+        if not strict_crop or time_ms[0] <= position <= time_ms[-1]:
+            visible_values.append(np.asarray([marker_value]))
         axis.axvspan(position - settings["pre_ms"], position + settings["post_ms"],
                      color=color, alpha=.07)
         axis.plot([], [], color=color,
@@ -191,7 +202,11 @@ def draw_trial_detail(axis, output, rows, time_ms, values, localization=None, di
     if judgment and "window_start_ms" in judgment:
         left = min(left, judgment["window_start_ms"]); right = max(right, judgment["window_end_ms"])
     margin = max((right - left) * .05, .001)
-    if letter_display_before_ms(output) is not None:
+    if strict_crop:
+        # Strict display crop; search, manual anchors and overlays never
+        # enlarge this interval beyond the Dot or AnimalStart endpoints.
+        axis.set_xlim(float(time_ms[0]), float(time_ms[-1]))
+    elif letter_display_before_ms(output) is not None:
         # The trace has already been read from Letter minus the display-only
         # duration (or the available source start). Do not pull the view back
         # to a different search/excerpt boundary or add a blank left margin.

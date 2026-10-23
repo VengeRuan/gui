@@ -14,7 +14,7 @@ import uuid
 
 import numpy as np
 
-from animal_peak_plotting import PLOT_STYLE, draw_trial_detail, judgment_info, apply_waveform_y_limits, waveform_y_limits, waveform_display, letter_display_before_ms
+from animal_peak_plotting import PLOT_STYLE, draw_trial_detail, judgment_info, apply_waveform_y_limits, waveform_y_limits, waveform_display, letter_display_before_ms, trial_display_mode
 from animal_peak_localization import localization_config, trial_localization
 from animal_peak_trial_selection import selected_average_group
 
@@ -398,6 +398,13 @@ def _source_metadata(meta):
             "provenance": getattr(meta, "provenance", {})}
 
 
+DOT_DISPLAY_LEAD_MS = 2000.
+
+
+class TrialDisplayRangeError(ValueError):
+    """A missing/invalid display anchor must not silently use another event."""
+
+
 def _trial_detail_bounds(source, output, rows):
     """Choose display samples separately from the immutable search/mean bounds."""
     first = max(0, min(min(row["search_first"], row["excerpt_first"]) for row in rows))
@@ -405,14 +412,35 @@ def _trial_detail_bounds(source, output, rows):
     _group, judgment, _summary = judgment_info(output, rows[0])
     if judgment and not judgment.get("reason"):
         first = min(first, judgment["first"]); last = max(last, judgment["last"])
-    before_ms = letter_display_before_ms(output)
-    if before_ms is not None:
+    if trial_display_mode(output) == "dot_animal":
+        row = rows[0]
+        try:
+            dot_sec = float(row["tag100_start_eeg_sec"])
+        except (KeyError, ValueError, TypeError):
+            dot_sec = np.nan
+        if row.get("tag100_status") != "csv" or row.get("tag100_source") != "csv" or not np.isfinite(dot_sec):
+            raise TrialDisplayRangeError("CSV Dot 开始时间缺失或无效（M列），不使用 TXT Tag100；可切换到 Letter 前显示。")
         offset = int(round(source.metadata.time_offset * output["fs"]))
-        marker_local = rows[0]["marker_sample"] - offset
-        first = max(0, marker_local - int(round(before_ms * output["fs"] / 1000)))
-        last = max(last, min(source.metadata.rows, marker_local + 1))
+        dot_sample = int(round(dot_sec * output["fs"])) - offset
+        animal = int(row["animal_local_sample"])
+        if dot_sample >= animal:
+            raise TrialDisplayRangeError("Dot 开始时间必须早于 AnimalStart；请检查 CSV 和行为匹配。")
+        # Display two seconds of context before the CSV Dot onset; retain
+        # the real Dot timestamp for validation and cue shading.
+        display_start = int(round((dot_sec - DOT_DISPLAY_LEAD_MS / 1000) * output["fs"])) - offset
+        first = max(0, display_start)
+        last = min(source.metadata.rows, animal + 1)  # Include AnimalStart itself.
+        if last - first < 2:
+            raise TrialDisplayRangeError("Dot → AnimalStart 范围没有足够的源数据。")
+    else:
+        before_ms = letter_display_before_ms(output)
+        if before_ms is not None:
+            offset = int(round(source.metadata.time_offset * output["fs"]))
+            marker_local = rows[0]["marker_sample"] - offset
+            first = max(0, marker_local - int(round(before_ms * output["fs"] / 1000)))
+            last = max(last, min(source.metadata.rows, marker_local + 1))
     if (last - first) * 32 > int(output["settings"].get("memory_budget_bytes", 256 * 1024 * 1024)):
-        raise ValueError("显示片段超过测试内存预算，请缩短 Letter 开始前显示长度。")
+        raise ValueError("显示片段超过测试内存预算，请缩短显示范围或切换为 Letter 前显示。")
     return first, last
 
 
@@ -488,7 +516,11 @@ def _json_safe(value):
 
 
 def export_animal_peak_results(output, source, directory, individual_png=True, progress=None, cancel=None):
-    """Save high-resolution figures, every trial page, audit CSV and numeric data.
+    """Save event/reference figures, trial pages, audit CSV and numeric data.
+
+    Peak/trough summary figures and latency histograms are intentionally
+    omitted, both as individual files and as pages in the combined PDF.
+    Their underlying CSV/NPZ data remain available unchanged.
 
     A new directory prevents overwrites. Cancellation leaves clearly marked,
     recoverable partial output, never deleting recordings or existing exports.
@@ -508,6 +540,12 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
     manifest = {"status": "incomplete", "settings": output["settings"], "source": output["source"],
                 "units": output["units"], "meaning": "Automatic-extremum or manually anchored means; similarity is descriptive, never an inclusion threshold."}
     manifest["display_settings"] = output.get("display_settings", {"y_axis_mode": "auto"})
+    manifest["figure_exports"] = {
+        "peak_trough_summary": False,
+        "peak_trough_latency_histograms": False,
+        "peak_trough_numeric_data": True,
+        "meaning": "Omit peak/trough average and latency-distribution figures from PNG, PDF and combined PDF; preserve numeric data, trial details and event/reference figures.",
+    }
     if output.get("mcp_control_history"):
         manifest["mcp_control_history"] = output["mcp_control_history"]
     manifest["waveform_display"] = {
@@ -594,7 +632,7 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
             if len(configuration["channel_ids"]) > 20:
                 channel_label += f" … 共 {len(configuration['channel_ids'])} 通道（完整列表见参数文件）"
             report = [
-                "AnimalStart 最大峰 / 最小谷对齐平均：测试报告",
+                "AnimalStart 事件对齐与逐 Trial 详情：测试报告",
                 f"文件：{output['source']['path']}", f"数据集：{output['source']['dataset']} | FS={output['fs']:g} Hz | 存储单位={output['units']}",
                 f"通道：{channel_label} | Tag：{configuration.get('tags') or '全部 Letter Tag'}",
                 f"原 Letter Epoch：{configuration['epoch_start_ms']:g}～{configuration['epoch_end_ms']:g} ms",
@@ -613,6 +651,7 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                 "排除原因（包含原 trial 排除及通道/分支不可计算记录）：",
                 *[f"  {reason}：{number}" for reason, number in reasons.items()],
                 "完整参数与处理历史见 parameters.json；所有 trial 编号、极值及原因见 trial_details.csv。",
+                "图像导出不包含最大峰/最小谷对齐平均图及峰时/谷时分布图；相应 CSV/NPZ 数值数据仍保留。",
                 "强制极值对齐可使背景波形形成平均峰；本结果不能单独作为稳定 VEP 的证据。",
             ]
             axis.text(.01, .99, "\n\n".join(report), va="top", ha="left", fontsize=9, wrap=True, transform=axis.transAxes)
@@ -622,28 +661,12 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
             export_letter_results(source, output, folder, combined_pdf=pdf, progress=progress, cancel=cancel)
             for (channel, tag), branches in sorted(pairs.items()):
                 _check(cancel)
-                fig = Figure(figsize=(12, 8), layout="constrained"); FigureCanvasAgg(fig)
-                axes = fig.subplots(2, 2)
-                fig.suptitle(f"{Path(output['source']['path']).name}\nch{channel} | Tag {tag} | 最大峰 / 最小谷对齐平均（相似度不筛选）", fontsize=12)
-                for column, branch in enumerate(("peak", "trough")):
+                for branch in ("peak", "trough"):
                     group = selected_average_group(output, branches.get(branch), cancel)
-                    title = "最大峰" if branch == "peak" else "最小谷"
-                    if group is not None and any(row.get("alignment_origin") == "manual" for row in group["rows"]):
-                        title = ("峰分支" if branch == "peak" else "谷分支") + "（含人工锚点）"
                     if group is None:
-                        axes[0, column].set_title(title + "：无完整截取片段")
                         continue
                     t = group["time_ms"]
-                    axes[0, column].plot(t, group["waves"].T * scale, color="0.6", alpha=.22, linewidth=.5)
-                    axes[0, column].plot(t, group["mean"] * scale, color="#b32025", linewidth=1.8, label="所选Trial等权平均")
-                    axes[0, column].fill_between(t, (group["mean"]-group["sem"])*scale,
-                                                 (group["mean"]+group["sem"])*scale, color="#b32025", alpha=.15, label="±SEM")
-                    axes[0, column].axvline(0, color="black", linestyle="--", linewidth=.8)
-                    axes[0, column].set(title=f"{title}对齐 | n={len(group['rows'])}" + ("（未选中可用Trial）" if not group["rows"] else ""), xlabel="相对最终对齐点（ms）", ylabel=unit)
-                    axes[0, column].legend(fontsize=8)
                     latency = [row["extreme_relative_ms"] for row in group["rows"]]
-                    axes[1, column].hist(latency, bins=min(20, max(1, len(latency))), color="#4177a3", alpha=.8)
-                    axes[1, column].set(xlabel="极值相对 AnimalStart（ms）", ylabel="Trial 数", title="保留原始峰时/谷时分布")
                     name = f"ch{channel}_tag{tag}_{branch}"
                     np.savez_compressed(folder / (name + ".npz"), time_ms=t, trials=group["waves"], mean=group["mean"],
                                         sem=group["sem"], valid_count=group["valid_count"],
@@ -688,14 +711,9 @@ def export_animal_peak_results(output, source, directory, individual_png=True, p
                                         trials=reference["waves"], mean=reference["mean"], sem=reference["sem"],
                                         valid_count=reference["valid_count"], units=output["units"], channel=channel, tag=tag,
                                         trial_ids=np.asarray([row["trial_id"] for row in reference["rows"]]))
-                for waveform_axis in axes[0]:
-                    apply_waveform_y_limits(waveform_axis, output)
-                fig.savefig(folder / f"ch{channel}_tag{tag}_summary.png", dpi=220)
-                fig.savefig(folder / f"ch{channel}_tag{tag}_summary.pdf")
-                pdf.savefig(fig); fig.clear()
                 done += 1
                 if progress:
-                    progress(done / max(1, count) * 100, f"导出平均图：ch{channel} / Tag {tag}")
+                    progress(done / max(1, count) * 100, f"导出数值及对照结果：ch{channel} / Tag {tag}")
             page = None
             axes = None
             previous_channel = None

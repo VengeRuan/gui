@@ -72,13 +72,14 @@ class LetterVepTests(unittest.TestCase):
         self.assertTrue(all(row["baseline_correction"]==0 for row in group["rows"]))
         self.assertEqual(output["settings"]["baseline_start_ms"],-200)
 
-    def test_animal_validity_is_required_but_peak_search_success_is_not(self):
+    def test_missing_animal_does_not_block_letter_but_known_invalidity_is_preserved(self):
         source,markers,matches,output=prepared()
         output=calculate(source,markers,matches,output,pair=(7,5))
         rows=output["letter_vep"]["cache"]["records"]
         self.assertEqual([row["trial_id"] for row in rows],[3,4,5])
-        self.assertEqual([row["reason_code"] for row in rows],["behavior_unmatched","validity_not_y","animal_outside_epoch"])
-        self.assertTrue(np.isnan(output["letter_vep"]["cache"]["mean"]).all())
+        self.assertEqual([row["reason_code"] for row in rows],["","validity_not_y","animal_outside_epoch"])
+        self.assertEqual(rows[0]["animal_reason_code"], "behavior_unmatched")
+        self.assertEqual(len(output["letter_vep"]["cache"]["selected_indices"]), 1)
         # Remove every located peak; Letter response remains available.
         output["groups"]=[]; output["records"]=[]
         result=calculate(source,markers,matches,output)
@@ -191,7 +192,7 @@ class LetterVepTests(unittest.TestCase):
             with (folder/"trial_details.csv").open(encoding="utf-8-sig") as handle:
                 rows=list(csv.DictReader(handle))
             self.assertEqual(len(rows),10)
-            self.assertEqual(sum(row["average_included"]=="True" for row in rows),3)
+            self.assertEqual(sum(row["average_included"]=="True" for row in rows),5)
             self.assertGreater((folder/"all_letter_start_vep.pdf").stat().st_size,500)
             self.assertTrue((folder/"ch7_tag4_letter_start.png").is_file())
             # Main complete export includes the new section without touching originals.
@@ -217,6 +218,8 @@ class LetterVepQtTests(unittest.TestCase):
             self.window=QtAnalysisGUI("Letter VEP test")
         self.source,self.markers,self.matches,output=prepared()
         self.dialog=AnimalPeakDialog(self.window,self.source,self.markers,self.matches,output["settings"])
+        self.dialog.trial_range_box.setCurrentIndex(self.dialog.trial_range_box.findData("letter"))
+        self.dialog.apply_letter_display_range()
         self.dialog.analysis_finished(output)
         self.dialog.tabs.setCurrentWidget(self.dialog.letter_vep_page); self.app.processEvents()
 

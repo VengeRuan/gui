@@ -193,6 +193,8 @@ class McpControlTests(unittest.TestCase):
         folder = Path(job["export_directory"])
         self.assertTrue(folder.is_relative_to(Path(self.temp.name).resolve()))
         self.assertTrue((folder/"parameters.json").is_file())
+        self.assertFalse(list(folder.glob("*_summary.png")))
+        self.assertFalse(list(folder.glob("*_summary.pdf")))
         manifest = json.loads((folder/"parameters.json").read_text(encoding="utf-8"))
         self.assertTrue(manifest["mcp_control_history"])
 
