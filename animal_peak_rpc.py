@@ -48,8 +48,10 @@ def list_sessions(directory=None):
             row = json.loads(path.read_text(encoding="utf-8"))
             if _session_path(row["session_id"], root) != path or row["api_version"] != API_VERSION:
                 continue
-            result.append({key: row[key] for key in ("session_id", "api_version", "implementation_version",
-                "pid", "project", "source_name", "created_utc")})
+            public = {key: row[key] for key in ("session_id", "api_version", "implementation_version",
+                "pid", "project", "source_name", "created_utc")}
+            public["session_kind"] = row.get("session_kind", "animalstart")
+            result.append(public)
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return result  # Tokens/ports are deliberately never exposed to the model.

@@ -143,6 +143,11 @@ if QT_BINDING == "PyQt5":
                                      ActionRole=QtWidgets.QMessageBox.ActionRole)
         Icon = SimpleNamespace(Warning=QtWidgets.QMessageBox.Warning)
 from snr_gui import compute_batch_channel_snr, compute_resting_multiband_snr, RESTING_MULTIBAND_DEFINITIONS
+from pipeline_control import pipeline_message_box
+
+# Interactive use is unchanged. Only messages belonging to an active MCP job
+# are returned in its report instead of blocking a remote caller in a modal box.
+QMessageBox = pipeline_message_box(QMessageBox)
 from h5_provenance import (
     compact_integer_ranges, compact_provenance_operations, derive_h5_provenance,
     read_h5_provenance, write_h5_provenance,
@@ -1607,6 +1612,8 @@ class PyQtGraphPreview(QWidget):
         )
         self.window_changed.emit(start / meta.fs, end / meta.fs)
         self.channel_previewed.emit(int(channel_id))
+        self._mcp_render_key = (id(self.source), self.channel_spin.value(), self.start_spin.value(),
+                                self.end_spin.value(), self.full_duration_check.isChecked(), self.linewidth_spin.value())
 
 
 class OverviewPageLoadWorker(QThread):
@@ -7338,12 +7345,31 @@ class QtAnalysisGUI(QMainWindow):
             self.resize(1200, 760)
         self.setMinimumSize(760, 520)
         self._build_ui_legacy_layout()
+        from pipeline_control import PipelineController
+        self._pipeline_mcp_controller = PipelineController(self)
+        self._pipeline_mcp_bridge = None
+        self.pipeline_mcp_check.toggled.connect(self._toggle_pipeline_mcp)
         audit_menu = self.menuBar().addMenu(f"操作记录（{self.operator_name}）")
         view_audit = audit_menu.addAction("查看多人操作记录")
         view_audit.triggered.connect(self.show_operation_audit_table)
         feishu_status = audit_menu.addAction("飞书同步状态与配置说明")
         feishu_status.triggered.connect(self.show_feishu_audit_status)
         self._audit_event("session_start", "程序启动")
+
+    def _toggle_pipeline_mcp(self, enabled: bool) -> None:
+        if self._pipeline_mcp_bridge is not None:
+            self._pipeline_mcp_bridge.close()
+            self._pipeline_mcp_bridge = None
+        if enabled:
+            try:
+                from animal_peak_bridge import AnimalPeakBridge
+                self._pipeline_mcp_bridge = AnimalPeakBridge(self._pipeline_mcp_controller)
+                self.pipeline_mcp_status.setText("MCP 已连接：预处理 / 时间对齐")
+            except Exception as exc:
+                self.pipeline_mcp_check.setChecked(False)
+                self.pipeline_mcp_status.setText(f"MCP 未启用：{exc}")
+        else:
+            self.pipeline_mcp_status.setText("MCP 未启用（不影响已启动任务）")
 
     def _create_legacy_variable_contract(self) -> None:
         """Create every audited Tk controller variable before building pages.
@@ -7878,6 +7904,14 @@ class QtAnalysisGUI(QMainWindow):
         self.workflow_path_var = self.workflow_label
         self.status_var = self.workflow_label
         sidebar_layout.addWidget(self.workflow_label)
+        self.pipeline_mcp_check = QCheckBox("允许 MCP 控制 2/3页")
+        self.pipeline_mcp_check.setToolTip("仅当前账号、本机认证连接；默认关闭。与 AnimalStart 测试窗口独立授权。")
+        self.pipeline_mcp_check.setStyleSheet("color:#ffffff; font-weight:600;")
+        self.pipeline_mcp_status = QLabel("MCP 未启用")
+        self.pipeline_mcp_status.setWordWrap(True)
+        self.pipeline_mcp_status.setStyleSheet("color:#c2d3df; font-size:11px;")
+        sidebar_layout.addWidget(self.pipeline_mcp_check)
+        sidebar_layout.addWidget(self.pipeline_mcp_status)
         workspace_panel = QFrame()
         workspace_panel.setObjectName("workspace")
         workspace_layout = QVBoxLayout(workspace_panel)
@@ -9480,6 +9514,9 @@ class QtAnalysisGUI(QMainWindow):
         )
         axis.grid(alpha=0.25)
         self.alignment_canvas.draw_idle()
+        controller = getattr(self, "_pipeline_mcp_controller", None)
+        if controller is not None:
+            controller.alignment_preview_signature = controller.alignment_preview_key()
 
     def _on_alignment_task_mode_changed(self, mode: str) -> None:
         """Switch only untouched default stimtags when Flash/Letter changes."""
@@ -10185,7 +10222,7 @@ class QtAnalysisGUI(QMainWindow):
         self.lfp_selected_ids = inherited
         self._invalidate_lfp_channel_dependent_results()
 
-    def run_alignment(self) -> None:
+    def run_alignment(self, *, segment_index=None) -> None:
         if not self.active_source.loaded:
             QMessageBox.information(self, "尚未加载数据", "请先加载 HDF5 数据文件。")
             return
@@ -10205,9 +10242,12 @@ class QtAnalysisGUI(QMainWindow):
             meta = self.active_source.metadata
             try:
                 timing = parse_alignment_log(
-                    log_path, float(self.bin_timing_metadata.get("deltaT1_sec", 0.0) or 0.0)
+                    log_path, float(self.bin_timing_metadata.get("deltaT1_sec", 0.0) or 0.0),
+                    segment_index=segment_index,
                 )
             except AlignmentSegmentSelectionRequired as choice:
+                if getattr(self, "_pipeline_mcp_messages", None) is not None:
+                    raise ValueError("日志含多个任务时段；先 read_table(table='segments')，再传入零基 segment_index。")
                 labels = []
                 for segment in choice.segments:
                     duration = (f"{segment['program_duration_sec']:.3f} s"
@@ -10312,6 +10352,9 @@ class QtAnalysisGUI(QMainWindow):
             )
             self._inherit_alignment_selection_for_lfp()
             self._update_file_banners()
+            controller = getattr(self, "_pipeline_mcp_controller", None)
+            if controller is not None:
+                controller.mark_alignment_applied()
             if cue_errors:
                 QMessageBox.warning(self, "CSV Dot 提示时间异常（不影响trial分析）",
                                     "\n".join(cue_errors[:20])
@@ -10596,6 +10639,9 @@ class QtAnalysisGUI(QMainWindow):
         worker.cancelled.connect(lambda *_: self._lfp_operation_cancelled(worker))
         worker.finished.connect(lambda: self._lfp_operation_finished(worker))
         self._refresh_lfp_cancel_button()
+        controller = getattr(self, "_pipeline_mcp_controller", None)
+        if controller is not None and getattr(self, "_pipeline_mcp_messages", None) is not None:
+            controller.track_worker(worker, label)
 
     def _connect_lfp_operation(self, worker, label, completed, failed, restore=None) -> None:
         self._track_lfp_operation(worker, label, restore)
@@ -13247,6 +13293,18 @@ class QtAnalysisGUI(QMainWindow):
                 and (self._car_worker is None or not self._car_worker.isRunning())
             ):
                 self._stop_one_click_preprocess()
+        elif step == "preprocess":
+            self.run_preprocess(
+                use_existing_remap=bool(self.remapped_source is not None and self.remapped_source.loaded),
+                preserve_channel_review=True,
+                notch_only=True,
+            )
+            if (
+                self._one_click_pipeline is pipeline
+                and pipeline["waiting"] == step
+                and (self._preprocess_worker is None or not self._preprocess_worker.isRunning())
+            ):
+                self._stop_one_click_preprocess()
         elif step == "ica":
             source = self.preprocessed_source or self.remapped_source or self.active_source
             eligible_ids = sorted(self._ica_eligible_channel_ids(source))
@@ -13290,6 +13348,7 @@ class QtAnalysisGUI(QMainWindow):
         QTimer.singleShot(0, self._continue_one_click_preprocess)
 
     def _finish_one_click_preprocess(self) -> None:
+        self._mcp_one_click_completed = True
         pipeline = self._one_click_pipeline
         if pipeline is not None:
             timings = list(pipeline.get("timings", []))
@@ -16313,6 +16372,9 @@ class QtAnalysisGUI(QMainWindow):
                 self._shared_preprocess_task_cancelled(w, task_label)
             )
         self.preprocess_progress.set_running(True, False)
+        controller = getattr(self, "_pipeline_mcp_controller", None)
+        if controller is not None:
+            controller.track_worker(worker, label)
 
     def _end_shared_preprocess_task(self, worker) -> None:
         tasks = [
@@ -17653,6 +17715,14 @@ class QtAnalysisGUI(QMainWindow):
         repeated = loaded.intersection(operation_names) - acknowledged
         if not repeated:
             return True
+        if getattr(self, "_pipeline_mcp_messages", None) is not None:
+            controller = self._pipeline_mcp_controller
+            if not controller.repeat_confirmed:
+                QMessageBox.warning(self, "重复预处理需单独确认",
+                                    "文件已记录这些处理步骤；如确需重复，明确传入 repeat_confirm=true。")
+                return False
+            self._repeat_preprocessing_acknowledged = acknowledged | repeated
+            return True
         labels = {"channel_remap": "通道重映射", "filter": "滤波", "reference": "CAR 重参考", "ica": "ICA"}
         names = "、".join(labels.get(name, name) for name in sorted(repeated))
         answer = QMessageBox.question(
@@ -18629,6 +18699,9 @@ class QtAnalysisGUI(QMainWindow):
             # in SQLite and is retried automatically at the next launch.
             sync_service.stop(timeout=4.0)
         self._cleanup_processing_cache_on_close()
+        bridge = getattr(self, "_pipeline_mcp_bridge", None)
+        if bridge is not None:
+            bridge.close()
         self._audit_session_closed = True
         super().closeEvent(event)
 

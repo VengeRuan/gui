@@ -16,13 +16,15 @@ from mcp.types import ImageContent, TextContent, ToolAnnotations
 from animal_peak_rpc import call_bridge, list_sessions as discover_sessions
 
 server = FastMCP("AnimalStart workstation control", instructions=(
-    "Control ONLY an explicitly enabled AnimalStart test-window session. First list_sessions, then get_state and describe_controls. "
+    "Control ONLY explicitly enabled GUI sessions. session_kind=animalstart is the test window; session_kind=pipeline is main-window pages 2(preprocess)/3(alignment). "
+    "Choose the correct session kind. First list_sessions, then get_state and describe_controls; controls/actions differ by session. "
     "Every mutation requires the chosen session_id and latest expected_revision from a read. Never silently retry writes after a timeout. "
     "set_parameters stages inputs; execute the corresponding apply/refresh action. Long tasks return job_id: poll get_jobs, do not restart. "
     "Use actual channel, Tag and ORIGINAL Trial IDs, not positional indices. Preserve manual points and chosen trials. "
     "filter/export and discarding unsaved results need explicit user authorization (confirm=true). "
     "Use get_plot_image to obtain PNG including title/axes; clipboard writes affect the workstation, not necessarily the local desktop. "
-    "Data/output remain on workstation; exports are confined to the GUI-authorized export root. "
+    "Data/output remain on workstation; AnimalStart exports are confined to its GUI-authorized export root. "
+    "Pipeline exports require explicit confirmation and a NEW absolute H5 path (no existing H5/CSV overwrite); streaming uses the existing processed directory. "
     "get_state identifies pending parameters and last applied results. A successful API call is not proof of physiological validity."))
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -35,7 +37,8 @@ def list_sessions() -> dict:
     """List explicitly enabled GUI sessions of the SAME Windows account. Never returns authentication tokens.
 
     Registry entries may be stale after a crash; verify the chosen session using get_state.
-    Empty list: open the AnimalStart test window on the workstation and enable its MCP control checkbox.
+    Empty list: enable the target window's MCP checkbox. Main-window pages 2/3 and AnimalStart have INDEPENDENT permission switches.
+    session_kind=pipeline identifies the main window; animalstart identifies an existing test dialog.
     """
     return dict(sessions=discover_sessions())
 
@@ -60,12 +63,15 @@ def describe_controls(session_id: str) -> dict:
 
 @server.tool(annotations=WRITE)
 def set_parameters(session_id: str, expected_revision: int,
-                   group: Literal["extraction","event","similarity","filter","view","manual"], values: dict[str,Any]) -> dict:
+                   group: Literal["extraction","event","similarity","filter","view","manual",
+                                  "preprocess","quality","ica","stream","alignment","task","preview"], values: dict[str,Any]) -> dict:
     """Stage a validated parameter patch using field names from describe_controls; not an automatic calculation.
 
     Event alignment=letter/dot/animal; duration_ms cannot be combined with explicit start_ms/end_ms.
     Dot/Letter look after onset, Animal looks before onset. Baseline defaults relative to Dot for Dot,
     LetterStart for others. Extraction aligned channels are read-only. Numeric values are never silently clipped.
+    Pipeline groups: preprocess,quality,ica,stream,alignment,task,preview. Paths are WORKSTATION absolute paths.
+    Pipeline channels/indices are integer lists (channels=null means all); see per-session describe_controls.
     """
     return call_bridge(session_id,"set_parameters",dict(group=group,values=values),expected_revision=expected_revision)
 
@@ -77,6 +83,8 @@ def navigate(session_id: str, expected_revision: int, selection: dict[str,Any]) 
     tab values: average,histogram,details,records,animal_reference,similarity,event.
     branch=peak/trough; detail_page is zero-based. trial_id automatically selects its detail page.
     reference_trial_id=null chooses automatic reference. Does not add channels or recompute peaks.
+    Pipeline selection: page=preprocess/alignment; channel=physical preview ID;
+    channels=[physical IDs] selects alignment/Letter scope, null=all confirmed healthy channels.
     """
     return call_bridge(session_id,"navigate",selection,expected_revision=expected_revision)
 
@@ -105,6 +113,13 @@ def execute(session_id: str, expected_revision: int, action: str, options: dict[
     job_id (cancel), plot/index (image/reset), x_range/y_range (reset_view), filename (new PNG export_plot),
     directory (export subdirectory within GUI-authorized root). Exports never overwrite source H5.
     Poll get_jobs for asynchronous operations; don't rerun a timed-out mutation automatically.
+    Pipeline actions (see describe_controls): load_h5,remap,filter,one_click,quality_check,saturation_check,
+    concentration_check,car,ica,clear_ica,review_channels,autofill_alignment,align,refresh_alignment,
+    refresh_preprocess,open_letter,open_flash,open_animalstart,export_preprocessed,stream_export,copy_plot,pause,resume,cancel.
+    Processing/import/review/export/align require options.confirm=true. Repeating recorded processing needs
+    repeat_confirm=true separately. align.segment_index is ZERO-based; first read_table(table=segments).
+    export_preprocessed requires NEW absolute path, refuses existing H5/CSV or source overwrite.
+    No implicit QC bypass or automatic confirmation of other dialogs. Poll job messages/errors after each action.
     """
     if options is not None and "action" in options:
         raise ValueError("options不能覆盖action。")
@@ -128,6 +143,7 @@ def get_plot_image(session_id: str, plot: str = "event", index: int = 0) -> list
     plot: event,average(0 peak/1 trough),histogram(0/1),details(current entire page),animal_reference,
     similarity(heatmap),manual_average(0/1). Does not copy toolbar/table or overwrite clipboard.
     Requires valid, non-busy current results; respects applied frame size/Y limits/current zoom.
+    Pipeline plots: alignment,preprocess,original; explicitly supply plot. PNG includes title and axes.
     """
     response = call_bridge(session_id,"get_image",dict(plot=plot,index=index))
     image = response["result"]
@@ -137,11 +153,14 @@ def get_plot_image(session_id: str, plot: str = "event", index: int = 0) -> list
 
 
 @server.tool(annotations=READ)
-def read_table(session_id: str, table: Literal["records","event","similarity","rankings"],
+def read_table(session_id: str, table: Literal["records","event","similarity","rankings","markers","annotations","segments","qc"],
                offset: int = 0, limit: int = 100) -> dict:
     """Read displayed table headers and rows, including exclusion reasons. Page size 1..500.
 
     event/similarity/rankings reflect current group and computed state; records is full extraction table.
+    Pipeline tables: markers (sample/tag/time), annotations (CSV Dot/Letter + behavior),
+    segments (ZERO-based segment_index plus timing from current log), qc (physical ID/decision/override/reasons).
+    Staged alignment inputs can differ from computed markers: inspect stale flag.
     """
     return call_bridge(session_id,"read_table",dict(table=table,offset=offset,limit=limit))
 

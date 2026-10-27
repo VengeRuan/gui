@@ -1,5 +1,7 @@
 # v3.0.0 — AnimalStart 测试窗口 MCP v1
 
+> 主窗口“2 预处理 / 3 时间对齐”的新增接口见 [MCP_PIPELINE_GUIDE.md](MCP_PIPELINE_GUIDE.md)。下文描述原 AnimalStart 会话；现在应先按 `session_kind` 区分窗口，再使用对应会话的 `describe_controls`。
+
 ## 版本边界
 
 `v2.1.10-no-mcp`（`b1e4586`）及此前发布版本**没有 MCP 控制能力**。本功能在独立开发分支 `feature/animalstart-mcp-v1` 上新增。可用基线标签取得完全未集成MCP的源码。

@@ -75,10 +75,12 @@ class AnimalPeakBridge(QtCore.QObject):
             protect_private_path(root, directory=True)
             path = root/(self.session_id+".json")
             # Directory is already private before the token is written.
+            metadata = (controller.session_metadata() if hasattr(controller, "session_metadata") else
+                        dict(source_name=Path(controller.dialog.source.metadata.path).name))
             path.write_text(json.dumps(dict(session_id=self.session_id, api_version=API_VERSION,
                 implementation_version=IMPLEMENTATION_VERSION, token=self.token, port=self.server.serverPort(),
                 pid=os.getpid(), project=str(Path(__file__).resolve().parent),
-                source_name=Path(controller.dialog.source.metadata.path).name,
+                **metadata,
                 created_utc=datetime.now(timezone.utc).isoformat()), ensure_ascii=False), encoding="utf-8")
             self.registry_path = path
             protect_private_path(path)
